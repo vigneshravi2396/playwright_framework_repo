@@ -382,19 +382,17 @@
 
         sh "rm -rf ${clientTestsDir}"
 
-        withEnv([
-            "CLIENT_REPO_URL=${clientUrl}",
-            "CLIENT_REPO_BRANCH=${clientBranch}",
-            "CLIENT_GIT_USERNAME=${params.client_username.trim()}",
-            "CLIENT_GIT_PASSWORD=${gitPassword}"
-        ]) {
-            sh '''
-                set -eu
-                set +x
-                git -c "credential.helper=!f() { echo username=$CLIENT_GIT_USERNAME; echo password=$CLIENT_GIT_PASSWORD; }; f" \
-                    clone --depth 1 --no-tags --branch "$CLIENT_REPO_BRANCH" "$CLIENT_REPO_URL" client-tests
-            '''
-        }
+        def repoHostPath = clientUrl.replaceFirst('(?i)^https://', '')
+        def encodedUser = java.net.URLEncoder.encode(params.client_username.trim(), 'UTF-8')
+        def encodedPass = java.net.URLEncoder.encode(gitPassword, 'UTF-8')
+        def cloneUrl = "https://${encodedUser}:${encodedPass}@${repoHostPath}"
+        def safeBranch = clientBranch.replace("'", "'\\''")
+
+        sh(label: 'Clone client repository', script: """
+            set -e
+            set +x
+            git clone --depth 1 --no-tags --branch '${safeBranch}' '${cloneUrl}' ${clientTestsDir}
+        """)
 
         echo "✅ Client repository checked out: ${clientUrl} @ ${clientBranch}"
     }
