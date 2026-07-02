@@ -674,11 +674,12 @@
             env.ZIP_NAME = zipName
 
             def overallExitCode = 0
-            suiteTestcase.each { suite, testcases ->
+            for (def suite : suiteTestcase.keySet()) {
+                def testcases = suiteTestcase[suite]
                 echo "🧪 Running suite: ${suite}"
                 def testPaths = buildPlaywrightTestPaths(suite, testcases as List)
                 def exitCode = runPlaywrightTests(suite, testPaths, PASSWORD, BASE_URL, USER_NAME)
-                createTestStatus(suite, exitCode)
+                this.createTestStatus(suite, exitCode)
                 if (exitCode != 0) {
                     overallExitCode = exitCode
                 }
@@ -698,33 +699,36 @@
 
     // New Requirement: run Playwright with dynamic test paths
     def runPlaywrightTests(String suite, List testPaths, String password, String baseUrl, String userName) {
-        def projectName = "${suite} - ${params.browser}"
+        def playwrightProject = [
+            chrome: 'chromium',
+            chromium: 'chromium',
+            firefox: 'firefox',
+            webkit: 'webkit'
+        ].get(params.browser, params.browser)
         def workersArg = params.workers ? "--workers=${params.workers}" : ''
         def pathsArg = testPaths.join(' ')
 
-        def exitCode = timeout(time: 90, unit: 'MINUTES') {
+        def testExitCode = timeout(time: 90, unit: 'MINUTES') {
             withEnv([
                 "PLAYWRIGHT_BROWSERS_PATH=${env.PLAYWRIGHT_BROWSERS_PATH ?: '/ms-playwright'}",
                 "PASSWORD=${password}",
                 "BASE_URL=${baseUrl}",
-                "USER_NAME=${userName}"
+                "USER_NAME=${userName}",
+                "SUITE=${suite}",
+                "BROWSER=${params.browser}",
+                "IS_REGRESSION=false"
             ]) {
                 def logPid = startPeriodicLogging()
 
+                def status = 1
                 try {
-                    exitCode = sh(
+                    status = sh(
                         script: """
                             set +e
-                            timeout 5400 ./node_modules/.bin/cross-env \
-                                SUITE="${suite}" \
-                                BROWSER="${params.browser}" \
-                                PASSWORD="\$PASSWORD" \
-                                BASE_URL="\$BASE_URL" \
-                                USER_NAME="\$USER_NAME" \
-                                IS_REGRESSION=false \
-                                ./node_modules/.bin/playwright test \
-                                ${pathsArg} \
-                                --project="${projectName}" \
+                            timeout 5400 \\
+                                ./node_modules/.bin/playwright test \\
+                                ${pathsArg} \\
+                                --project="${playwrightProject}" \\
                                 ${workersArg}
                             EXIT_CODE=\$?
                             exit \$EXIT_CODE
@@ -733,7 +737,7 @@
                     )
                 } catch (Exception e) {
                     echo "⚠️ Test execution error: ${e.message}"
-                    exitCode = 1
+                    status = 1
                 } finally {
                     stopPeriodicLogging(logPid)
                 }
@@ -745,10 +749,12 @@
                     ls -R test-results || true
                     ls -R playwright-report || true
                 '''
+
+                return status
             }
         }
 
-        return exitCode
+        return testExitCode
     }
 
     def createTestStatus(String suite, int exitCode) {
