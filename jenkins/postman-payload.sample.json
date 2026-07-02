@@ -1,0 +1,19 @@
+{
+  "client_repo_url": "https://github.com/qadence-ai/boilerplate-qa.git",
+  "client_branch": "vignesh_test_poc_new",
+  "client_username": "your-github-username",
+  "client_pat": "your-github-personal-access-token",
+  "suite_testcase": "{\"ClinicalLab\": [\"TC_05_lab.spec.ts\"]}",
+  "browser": "chrome",
+  "environment": "dev",
+  "s3_prefix": "/testing/results/upload/2026-06-17_07-43-21/staging",
+  "aws_access_key_id": "your-aws-access-key-id",
+  "aws_secret_access_key": "your-aws-secret-access-key",
+  "aws_region": "us-east-1",
+  "tenantId": "tenant-001",
+  "applicationId": "app-001",
+  "test_execution_id": "exec-001",
+  "test_execution_request_id": "req-001",
+  "test_run_id": "run-001",
+  "workers": "4"
+}

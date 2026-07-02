@@ -18,9 +18,9 @@
                 description: 'Username for client repository checkout'
             )
             password(
-                name: 'client_password',
+                name: 'client_pat',
                 defaultValue: '',
-                description: 'Password or Personal Access Token for client repository checkout'
+                description: 'Personal Access Token for client repository checkout'
             )
             // New Requirement: suite_testcase JSON mapping suites to test files
             text(
@@ -356,9 +356,9 @@
         if (!params.client_username?.trim()) {
             error('client_username is mandatory')
         }
-        String gitPassword = params.client_password.toString().trim()
+        String gitPassword = params.client_pat.toString().trim()
         if (!gitPassword) {
-            error('client_password is mandatory')
+            error('client_pat is mandatory')
         }
 
         def clientBranch = params.client_branch?.trim()
