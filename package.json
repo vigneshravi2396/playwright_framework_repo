@@ -1,0 +1,36 @@
+{
+  "name": "playwright boilerplate template",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@playwright/test": "^1.59.0",
+    "@typescript-eslint/eslint-plugin": "^8.35.0",
+    "@typescript-eslint/parser": "^8.35.0",
+    "allure-commandline": "^2.34.0",
+    "allure-playwright": "^3.2.2",
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.5.0",
+    "eslint": "^9.29.0",
+    "openai": "^4.103.0",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.8.3"
+  },
+  "scripts": {
+    "test": "npx cross-env ENV=$ENV USER_PASSWORD=$USER_PASSWORD npx playwright test",
+    "allure:generate": "npx allure generate --clean",
+    "allure:open": "allure open ./allure-report",
+    "clean:allure": "rm -rf allure-results allure-report",
+    "lint": "eslint . --ext .ts,.js",
+    "lint:fix": "eslint . --ext .ts,.js --fix",
+    "type-check": "tsc --noEmit",
+    "codegen:manual": "node src/customRecorder/POC-2-codegen-MetadataInjector-manual/start-codegen-with-metadata.js"
+  },
+  "dependencies": {
+    "playwrightcopilot": "file:"
+  }
+}

@@ -1,0 +1,375 @@
+  name: Reya - Test execution workflow
+
+  on:
+    workflow_dispatch:
+      inputs:
+        suite:
+          description: 'Suite to run (or regression for all)'
+          required: true
+          type: choice
+          options:
+            - cart
+            - login
+            - purchase
+            - sorting
+            - regression
+        browser:
+          description: 'Browser to run tests on'
+          required: true
+          type: choice
+          options:
+            - firefox
+            - webkit
+            - chrome
+        environment:
+          description: 'Target environment'
+          required: true
+          type: choice
+          options:
+            - staging
+            - dev
+        s3_prefix:
+          description: 'Folder path inside the S3 bucket'
+          required: true
+          type: string
+        test_run_id:
+          description: 'Run ID for this execution - BE only - Give Random value'
+          required: true
+          type: string
+        tenantId:
+          description: 'Tenant ID for this execution - BE only - Give Random value'
+          required: true
+          type: string
+        applicationId:
+          description: 'App ID for this execution - BE only - Give Random value'
+          required: true
+          type: string
+        test_execution_id:
+          description: 'Test Execution ID for this execution - BE only - Give Random value'
+          required: true
+          type: string
+        test_execution_request_id:
+          description: 'Test Execution Request ID for this execution - BE only - Give Random value'
+          required: true
+          type: string
+
+  jobs:
+
+    metadata:
+      runs-on: ubuntu-latest
+      name: Save Test Metadata
+      steps:
+        - name: Create metadata file
+          run: |
+            cat <<EOF > metadata.json
+            {
+              "tenantId": "${{ github.event.inputs.tenantId }}",
+              "applicationId": "${{ github.event.inputs.applicationId }}",
+              "test_run_id": "${{ github.event.inputs.test_run_id }}",
+              "test_execution_id": "${{ github.event.inputs.test_execution_id }}",
+              "test_execution_request_id": "${{ github.event.inputs.test_execution_request_id }}",
+              "suite": "${{ github.event.inputs.suite }}",
+              "browser": "${{ github.event.inputs.browser }}",
+              "environment": "${{ github.event.inputs.environment }}",
+              "s3_prefix": "${{ github.event.inputs.s3_prefix }}",
+              "github_run_id": "${{ github.run_id }}"
+            }
+            EOF
+
+        - name: Upload Metadata Artifact
+          uses: actions/upload-artifact@v4
+          with:
+            name: metadata_${{ github.event.inputs.tenantId }}_${{ github.event.inputs.applicationId }}_${{ github.event.inputs.test_run_id }}_${{ github.event.inputs.test_execution_id }}_${{ github.event.inputs.test_execution_request_id }}
+            path: metadata.json
+            retention-days: 1
+
+    run-single-suite:
+      if: ${{ github.event.inputs.suite != 'regression' }}
+      runs-on: ubuntu-latest
+      environment: ${{ github.event.inputs.environment }}
+      name: Run Single Suite (${{ github.event.inputs.suite }})
+      env:
+        ENV: ci
+        PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
+        BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL }}
+        USER_NAME: ${{ secrets.USER_NAME || vars.USER_NAME }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
+        SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
+        ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
+      steps:
+        - uses: actions/checkout@v3
+
+        - uses: actions/setup-node@v3
+          with:
+            node-version: 18
+
+        - run: npm ci
+        
+        - name: Install Playwright Dependencies
+          run: npx playwright install-deps
+        - run: npx playwright install
+
+        - name: Verify required configuration
+          run: |
+            missing=""
+            [ -z "$BASE_URL" ] && missing="${missing} BASE_URL"
+            [ -z "$USER_NAME" ] && missing="${missing} USER_NAME"
+            [ -z "$PASSWORD" ] && missing="${missing} PASSWORD"
+            if [ -n "$missing" ]; then
+              echo "::error::Missing required values:$missing"
+              echo "Add them under Settings → Secrets and variables → Actions (Secrets and/or Variables tabs)."
+              echo "The workflow reads secrets.* first, then falls back to vars.*"
+              exit 1
+            fi
+            echo "BASE_URL is set (length ${#BASE_URL})"
+
+        - name: Set variables
+          run: |
+            SUITE_NAME="${{ github.event.inputs.suite }}"
+            DATETIME=$(date +'%Y%m%d_%H%M%S')
+            {
+              echo "SUITE_NAME=${SUITE_NAME}"
+              echo "SUITE_DIR=${SUITE_NAME}_${DATETIME}"
+              echo "ZIP_NAME=${SUITE_NAME}_${DATETIME}.zip"
+            } >> "$GITHUB_ENV"
+
+        - name: Run ${{ github.event.inputs.suite }} Tests
+          id: run_tests
+          run: |
+            set +e
+            PROJECT_NAME="${{ github.event.inputs.suite }} - ${{ github.event.inputs.browser }}"
+            npx cross-env \
+              SUITE="${{ github.event.inputs.suite }}" \
+              BROWSER="${{ github.event.inputs.browser }}" \
+              IS_REGRESSION=false \
+              npx playwright test --project="$PROJECT_NAME"
+            EXIT_CODE=$?
+            echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+            exit 0
+
+        - name: Download metadata.json
+          uses: actions/download-artifact@v4
+          with:
+            name: metadata_${{ github.event.inputs.tenantId }}_${{ github.event.inputs.applicationId }}_${{ github.event.inputs.test_run_id }}_${{ github.event.inputs.test_execution_id }}_${{ github.event.inputs.test_execution_request_id }}
+            path: .
+
+        - name: Zip Reports and Upload (Single Suite)
+          run: |
+            REPORT_DIR="reports/${SUITE_NAME}"
+            mkdir -p "$SUITE_DIR"
+            if [ -f "${REPORT_DIR}/results.json" ]; then
+              cp "${REPORT_DIR}/results.json" "$SUITE_DIR/results.json"
+            fi
+            if [ -d "${REPORT_DIR}/html-report" ]; then
+              cp -r "${REPORT_DIR}/html-report" "$SUITE_DIR/html-report"
+            fi
+            cp metadata.json "$SUITE_DIR/metadata.json" 2>/dev/null || true
+            if [ -d "test-results" ]; then
+              mkdir -p "$SUITE_DIR/test-results"
+              cp -r test-results/* "$SUITE_DIR/test-results/" 2>/dev/null || true
+            fi
+            (cd "$SUITE_DIR" && zip -r "${GITHUB_WORKSPACE}/${ZIP_NAME}" .)
+            echo "Zip contents:"
+            unzip -l "${ZIP_NAME}"
+
+
+        - name: Upload Zipped Bundle (Single Suite)
+          uses: actions/upload-artifact@v4
+          with:
+            name: ${{ env.ZIP_NAME }}
+            path: ${{ env.ZIP_NAME }}
+            retention-days: 1
+        
+        - name: Upload to S3 (Custom folder from input)
+          run: |
+            which aws || (sudo apt-get update && sudo apt-get install -y awscli)
+            export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID || vars.AWS_ACCESS_KEY_ID }}
+            export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY || vars.AWS_SECRET_ACCESS_KEY }}
+            export AWS_REGION=us-east-1
+
+            echo "Uploading $ZIP_NAME to s3://taas-qa-ai${{ github.event.inputs.s3_prefix }}"
+            aws s3 cp "$ZIP_NAME" "s3://taas-qa-ai/${{ github.event.inputs.s3_prefix }}/${{ github.event.inputs.environment }}/$ZIP_NAME" --region "$AWS_REGION"
+
+        - name: Fail job if tests failed
+          if: ${{ steps.run_tests.outputs.exit_code != '0' }}
+          run: exit 1
+
+    regression:
+      if: ${{ github.event.inputs.suite == 'regression' }}
+      runs-on: ubuntu-latest
+      environment: ${{ github.event.inputs.environment }}
+      strategy:
+        matrix:
+          suite: [cart, login, purchase, sorting]
+        fail-fast: false
+      name: regression
+      env:
+        ENV: ci
+        PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
+        BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL }}
+        USER_NAME: ${{ secrets.USER_NAME || vars.USER_NAME }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
+        SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
+        ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
+      steps:
+        - uses: actions/checkout@v3
+
+        - uses: actions/setup-node@v3
+          with:
+            node-version: 18
+
+        - run: npm ci
+
+        - name: Install Playwright Dependencies
+          run: npx playwright install-deps
+          
+        - run: npx playwright install
+
+        - name: Verify required configuration
+          run: |
+            missing=""
+            [ -z "$BASE_URL" ] && missing="${missing} BASE_URL"
+            [ -z "$USER_NAME" ] && missing="${missing} USER_NAME"
+            [ -z "$PASSWORD" ] && missing="${missing} PASSWORD"
+            if [ -n "$missing" ]; then
+              echo "::error::Missing required values:$missing"
+              echo "Add them under Settings → Secrets and variables → Actions (Secrets and/or Variables tabs)."
+              exit 1
+            fi
+
+        - name: Set variables
+          run: |
+            SUITE_NAME="${{ matrix.suite }}"
+            DATETIME=$(date +'%Y%m%d_%H%M%S')
+            {
+              echo "SUITE_NAME=${SUITE_NAME}"
+              echo "SUITE_DIR=${SUITE_NAME}_${DATETIME}"
+              echo "ZIP_NAME=${SUITE_NAME}_${DATETIME}.zip"
+            } >> "$GITHUB_ENV"
+
+        - name: Run ${{ matrix.suite }} Tests
+          id: run_tests
+          run: |
+            set +e
+            PROJECT_NAME="${{ matrix.suite }} - ${{ github.event.inputs.browser }}"
+            npx cross-env \
+              SUITE="${{ matrix.suite }}" \
+              BROWSER="${{ github.event.inputs.browser }}" \
+              IS_REGRESSION=true \
+              npx playwright test --project="$PROJECT_NAME"
+            EXIT_CODE=$?
+            echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+            exit 0
+
+        - name: Download metadata.json
+          uses: actions/download-artifact@v4
+          with:
+            name: metadata_${{ github.event.inputs.tenantId }}_${{ github.event.inputs.applicationId }}_${{ github.event.inputs.test_run_id }}_${{ github.event.inputs.test_execution_id }}_${{ github.event.inputs.test_execution_request_id }}
+            path: .
+
+        - name: Prepare and Zip Suite Bundle
+          run: |
+            REPORT_DIR="reports/${SUITE_NAME}"
+            mkdir -p "$SUITE_DIR"
+            if [ -f "${REPORT_DIR}/results.json" ]; then
+              cp "${REPORT_DIR}/results.json" "$SUITE_DIR/results.json"
+            fi
+            if [ -d "${REPORT_DIR}/html-report" ]; then
+              cp -r "${REPORT_DIR}/html-report" "$SUITE_DIR/html-report"
+            fi
+            cp metadata.json "$SUITE_DIR/metadata.json" 2>/dev/null || true
+            if [ -d "test-results" ]; then
+              mkdir -p "$SUITE_DIR/test-results"
+              cp -r test-results/* "$SUITE_DIR/test-results/" 2>/dev/null || true
+            fi
+            (cd "$SUITE_DIR" && zip -r "${GITHUB_WORKSPACE}/${ZIP_NAME}" .)
+            echo "Zip contents:"
+            unzip -l "${ZIP_NAME}"
+
+        - name: Upload Individual Suite Zip
+          uses: actions/upload-artifact@v4
+          with:
+            name: ${{ env.ZIP_NAME }}
+            path: ${{ env.ZIP_NAME }}
+
+        - name: Set job status
+          if: ${{ steps.run_tests.outputs.exit_code != '0' }}
+          run: |
+            echo "Tests failed for ${{ matrix.suite }}"
+            exit 1
+
+    zip-regression:
+      if: ${{ always() && github.event.inputs.suite == 'regression' }}
+      needs: regression
+      runs-on: ubuntu-latest
+      environment: ${{ github.event.inputs.environment }}
+      name: Create Combined Regression Zip
+      steps:
+        - uses: actions/checkout@v3
+
+        - name: Set timestamp
+          run: echo "ZIP_TS=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_ENV
+
+        - name: Download All Individual Zipped Suite Artifacts
+          uses: actions/download-artifact@v4
+          with:
+            pattern: '*_*.zip'
+            path: downloaded-zips
+            merge-multiple: true
+
+        - name: Download metadata.json
+          uses: actions/download-artifact@v4
+          with:
+            name: metadata_${{ github.event.inputs.tenantId }}_${{ github.event.inputs.applicationId }}_${{ github.event.inputs.test_run_id }}_${{ github.event.inputs.test_execution_id }}_${{ github.event.inputs.test_execution_request_id }}
+            path: .
+
+        - name: Debug downloaded zips
+          run: |
+            echo "Downloaded ZIP files:"
+            ls -lh downloaded-zips/
+
+        - name: Unzip All Suite Zips
+          run: |
+            mkdir -p regression-combined
+            for zipfile in downloaded-zips/*.zip; do
+              SUITE_FOLDER=$(basename "$zipfile" .zip)
+              unzip "$zipfile" -d "regression-combined/$SUITE_FOLDER"
+            done
+
+        - name: Add metadata.json to combined regression folder
+          run: |
+            cp metadata.json regression-combined/ || true
+
+        - name: Zip Combined Regression Folder
+          run: |
+            FINAL_ZIP_NAME="Regression_${ZIP_TS}.zip"
+            cd regression-combined
+            zip -r "../$FINAL_ZIP_NAME" .
+            cd ..
+            echo "FINAL_ZIP_NAME=$FINAL_ZIP_NAME" >> $GITHUB_ENV
+
+        - name: Upload Combined Regression Report
+          uses: actions/upload-artifact@v4
+          with:
+            name: ${{ env.FINAL_ZIP_NAME }}
+            path: ${{ env.FINAL_ZIP_NAME }}
+
+        - name: Upload to S3 (Custom folder from input)
+          run: |
+            which aws || (sudo apt-get update && sudo apt-get install -y awscli)
+            export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID || vars.AWS_ACCESS_KEY_ID }}
+            export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY || vars.AWS_SECRET_ACCESS_KEY }}
+            export AWS_REGION=us-east-1
+            echo "Uploading $FINAL_ZIP_NAME to s3://taas-qa-ai${{ github.event.inputs.s3_prefix }}"
+            aws s3 cp "$FINAL_ZIP_NAME" "s3://taas-qa-ai/${{ github.event.inputs.s3_prefix }}/${{ github.event.inputs.environment }}/$FINAL_ZIP_NAME" --region "$AWS_REGION"
+
+    # cleanup:
+    #   if: always()
+    #   runs-on: ubuntu-latest
+    #   needs: [metadata, run-single-suite, regression, zip-regression]
+    #   steps:
+    #     - name: Delete all artifacts
+    #       uses: geekyeggo/delete-artifact@v4
+    #       with:
+    #         name: "*"
+    #         failOnError: false

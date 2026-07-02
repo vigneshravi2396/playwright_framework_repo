@@ -1,0 +1,822 @@
+    pipeline {
+        agent none
+
+        parameters {
+            // New Requirement: branch and commit parameters for targeted checkout
+            string(
+                name: 'branch_name',
+                defaultValue: '',
+                description: 'Git branch to checkout'
+            )
+            string(
+                name: 'commit_id',
+                defaultValue: '',
+                description: 'Optional commit SHA to checkout after branch'
+            )
+            // New Requirement: suite_testcase JSON mapping suites to test files
+            text(
+                name: 'suite_testcase',
+                defaultValue: '',
+                description: 'JSON map of suite names to testcase files (use "all" for full suite)'
+            )
+            choice(
+                name: 'browser',
+                choices: ['chrome', 'firefox', 'webkit', 'chromium'],
+                description: 'Browser to run tests on'
+            )
+            choice(
+                name: 'environment',
+                choices: ['dev', 'staging'],
+                description: 'Target environment for secrets'
+            )
+            string(
+                name: 's3_prefix',
+                defaultValue: '/testing/results/upload/2026-06-17_07-43-21/staging',
+                description: 'Folder path inside the S3 bucket'
+            )
+            string(name: 'test_run_id', defaultValue: '', description: 'Run ID for this execution')
+            string(name: 'tenantId', defaultValue: '', description: 'Tenant ID for this execution')
+            string(name: 'applicationId', defaultValue: '', description: 'App ID for this execution')
+            string(name: 'test_execution_id', defaultValue: '', description: 'Test Execution ID')
+            string(name: 'test_execution_request_id', defaultValue: '', description: 'Test Execution Request ID')
+            string(
+                name: 'workers',
+                defaultValue: '4',
+                description: 'Number of parallel workers'
+            )
+        }
+
+        environment {
+            CI = 'true'
+            AWS_REGION = 'us-east-1'
+            METADATA_FILE = 'metadata.json'
+            BUILD_UNIQUE_ID = "build-${BUILD_NUMBER}-${BUILD_ID}"
+            BROWSER_CACHE_FILE = '/tmp/.playwright-browsers-verified'
+            NPM_HASH_FILE = '.npm-install-hash'
+            DOCKER_AGENT_IMAGE = 'playwright-taas:v1.55.0-chrome'
+        }
+
+        options {
+            buildDiscarder(logRotator(numToKeepStr: '15', artifactNumToKeepStr: '10'))
+            timestamps()
+            timeout(time: 2, unit: 'HOURS')
+            skipDefaultCheckout(true)
+        }
+
+        stages {
+            stage('Ensure Docker Image') {
+                agent { label 'built-in' }
+                steps {
+                    script {
+                        try {
+                            echo '🔄 Checking out repository (required for Docker build context)...'
+                            checkoutRepository()
+                            ensureDockerAgentImage()
+                        } catch (Exception e) {
+                            error("❌ Docker image preparation failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            stage('Run Pipeline') {
+                agent {
+                    docker {
+                        image 'playwright-taas:v1.55.0-chrome'
+                        label 'built-in'
+                        args '-u root --shm-size=2gb'
+                        reuseNode true
+                    }
+                }
+                stages {
+            stage('Prepare Workspace') {
+                steps {
+                    script {
+                        try {
+                            echo '🧹 Cleaning workspace before pipeline execution...'
+                            cleanWorkspace()
+                            echo '✅ Workspace prepared'
+                        } catch (Exception e) {
+                            error("❌ Workspace preparation failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            stage('Checkout') {
+                steps {
+                    script {
+                        try {
+                            echo '🔄 Checking out repository...'
+                            checkoutRepository()
+                            echo '✅ Checkout completed successfully'
+                        } catch (Exception e) {
+                            error("❌ Checkout failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+            
+            stage('Validate Suite') {
+                steps {
+                    script {
+                        // New Requirement: validate branch_name and suite_testcase JSON
+                        if (!params.branch_name?.trim()) {
+                            error('branch_name is mandatory')
+                        }
+                        def suiteTestcase = parseSuiteTestcase()
+                        validateSuiteTestcase(suiteTestcase)
+                    }
+                }
+            }
+
+            stage('Setup') {
+                environment {
+                    PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+                }
+                steps {
+                    script {
+                        try {
+                            echo '📦 Installing dependencies...'
+                            installDependenciesOptimized()
+
+                            echo '✅ Setup completed successfully'
+                        } catch (Exception e) {
+                            error("❌ Setup failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            stage('Create Metadata') {
+                steps {
+                    script {
+                        try {
+                            createMetadata()
+                        } catch (Exception e) {
+                            error("❌ Metadata creation failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            stage('Execute Tests') {
+                options {
+                    timeout(time: 100, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        try {
+                            runSuiteTestcases()
+                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                            echo '⏱️ Test execution timed out'
+                            currentBuild.result = 'UNSTABLE'
+                        } catch (Exception e) {
+                            echo "⚠️ Test execution encountered errors: ${e.message}"
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    }
+                }
+            }
+
+            stage('Upload to S3') {
+                steps {
+                    script {
+                        try {
+                            uploadToS3Optimized(env.ZIP_NAME)
+                        } catch (Exception e) {
+                            currentBuild.result = 'UNSTABLE'
+                            echo "⚠️ S3 upload failed: ${e.message}"
+                        }
+                    }
+                }
+            }
+
+            stage('Archive Artifacts') {
+                steps {
+                    script {
+                        try {
+                            echo '📦 Archiving artifacts...'
+                            archiveArtifacts(
+                                artifacts: '**/*.zip,metadata.json,test_status*.json,test_summary.json',
+                                allowEmptyArchive: true,
+                                fingerprint: true,
+                                onlyIfSuccessful: false
+                            )
+                        } catch (Exception e) {
+                            echo "⚠️ Artifact archiving failed: ${e.message}"
+                        }
+                    }
+                }
+            }
+                }
+            }
+        }
+
+        post {
+            always {
+                script {
+                    printSummary()
+                    try {
+                        echo '🧹 Cleaning workspace after pipeline execution...'
+                        cleanWorkspace()
+                        echo '✅ Workspace cleaned'
+                    } catch (Exception e) {
+                        echo "⚠️ Final workspace cleanup failed: ${e.message}"
+                    }
+                }
+            }
+
+            success {
+                echo '✅ Pipeline completed successfully!'
+            }
+
+            unstable {
+                echo '⚠️ Pipeline unstable - Some tests failed or upload issues occurred'
+            }
+
+            failure {
+                echo '❌ Pipeline failed - Check logs for details'
+            }
+
+            aborted {
+                echo '🛑 Pipeline aborted by user'
+            }
+        }
+    }
+
+    // ============================================================================
+    // OPTIMIZED UTILITY FUNCTIONS - ALL FIXED
+    // ============================================================================
+
+    // Git checkout via Jenkins checkout step — reuses job SCM URL, credentials, and extensions.
+    // Replaces shell "git checkout" commands to avoid dubious-ownership errors in Docker agents.
+    def checkoutRepository() {
+        def branch = params.branch_name?.trim()
+        def commit = params.commit_id?.trim()
+
+        // No branch override — use the job's configured SCM as-is
+        if (!branch) {
+            checkout scm
+            return
+        }
+
+        // branch_name only: checkout the specified branch through Git SCM plugin
+        checkout buildGitScmConfig(branch)
+        echo "✅ Checked out branch: ${branch}"
+
+        // branch_name + commit_id: second checkout pins the workspace to the exact commit
+        if (commit) {
+            checkout buildGitScmConfig(commit)
+            echo "✅ Checked out commit: ${commit}"
+        }
+    }
+
+    // Builds a GitSCM config from the job's existing scm, overriding only the branch/commit ref
+    def buildGitScmConfig(String ref) {
+        def branchSpec = (ref ==~ /^[0-9a-fA-F]{7,40}$/) ? ref : "*/${ref}"
+        return [
+            $class: 'GitSCM',
+            branches: [[name: branchSpec]],
+            doGenerateSubmoduleConfigurations: scm.doGenerateSubmoduleConfigurations,
+            extensions: scm.extensions ?: [],
+            submoduleCfg: scm.submoduleCfg,
+            userRemoteConfigs: scm.userRemoteConfigs
+        ]
+    }
+
+    // New Requirement: parse suite_testcase JSON parameter
+    def parseSuiteTestcase() {
+        if (!params.suite_testcase?.trim()) {
+            error('suite_testcase is mandatory')
+        }
+        def parsed
+        try {
+            parsed = readJSON text: params.suite_testcase.trim()
+        } catch (Exception e) {
+            error("Invalid suite_testcase JSON: ${e.message}")
+        }
+        if (!(parsed instanceof Map) || parsed.isEmpty()) {
+            error('suite_testcase must be a non-empty JSON object')
+        }
+        return parsed
+    }
+
+    // New Requirement: validate all suite folders and testcase files from JSON
+    def validateSuiteTestcase(Map suiteTestcase) {
+        suiteTestcase.each { suite, testcases ->
+            echo "Validating suite: ${suite}"
+            def suiteExists = sh(
+                script: "test -d tests/${suite}",
+                returnStatus: true
+            ) == 0
+            if (!suiteExists) {
+                error("Suite '${suite}' not found at tests/${suite}")
+            }
+            if (!(testcases instanceof List) || testcases.isEmpty()) {
+                error("Suite '${suite}' must have at least one testcase")
+            }
+            testcases.each { testcase ->
+                if (testcase == 'all') {
+                    return
+                }
+                def specPath = "tests/${suite}/${testcase}"
+                def testcaseExists = sh(
+                    script: "test -f ${specPath}",
+                    returnStatus: true
+                ) == 0
+                if (!testcaseExists) {
+                    error("Testcase '${testcase}' not found at ${specPath}")
+                }
+            }
+            echo "Suite '${suite}' validated"
+        }
+    }
+
+    // New Requirement: build Playwright test paths from suite and testcase list
+    def buildPlaywrightTestPaths(String suite, List testcases) {
+        if (testcases.contains('all')) {
+            return ["tests/${suite}"]
+        }
+        return testcases.collect { "tests/${suite}/${it}" }
+    }
+
+    def ensureDockerAgentImage() {
+        def image = env.DOCKER_AGENT_IMAGE
+        def exists = sh(
+            script: "docker image inspect ${image} >/dev/null 2>&1",
+            returnStatus: true
+        ) == 0
+
+        if (exists) {
+            echo "✅ Docker image ${image} already exists — skipping build"
+            return
+        }
+
+        echo "🐳 Docker image ${image} not found — building from jenkins/Dockerfile..."
+        def exitCode = sh(
+            script: """
+                set -e
+                docker build -t ${image} -f jenkins/Dockerfile .
+            """,
+            returnStatus: true
+        )
+
+        if (exitCode != 0) {
+            error("❌ Failed to build Docker image ${image} (exit code: ${exitCode})")
+        }
+
+        echo "✅ Docker image ${image} built successfully"
+    }
+
+    def cleanWorkspace() {
+        sh '''
+            set +e
+            chmod -R u+w . 2>/dev/null || true
+            rm -rf test-results reports node_modules playwright-report blob-report .npm-install-hash 2>/dev/null || true
+            find . -maxdepth 1 -name '*.zip' -exec rm -f {} + 2>/dev/null || true
+        '''
+        cleanWs(
+            deleteDirs: true,
+            disableDeferredWipeout: true,
+            notFailBuild: true
+        )
+    }
+
+    def startPeriodicLogging() {
+        def logPid = sh(
+            script: '''
+                (
+                    while true; do
+                        sleep 60
+                        echo "⏳ [$(date +%H:%M:%S)] Tests still running... (This message appears every 60 seconds)"
+                        if pgrep -f "playwright" > /dev/null 2>&1; then
+                            echo "   ✓ Playwright processes detected"
+                        else
+                            echo "   ⚠️ No Playwright processes found"
+                        fi
+                    done
+                ) &
+                echo $!
+            ''',
+             returnStdout: true
+        ).trim()
+        return logPid
+    }
+
+    def stopPeriodicLogging(String logPid) {
+        if (logPid && logPid.trim()) {
+            sh "kill ${logPid.trim()} 2>/dev/null || true"
+        }
+    }
+
+    def installDependenciesOptimized() {
+        def hashFile = env.NPM_HASH_FILE
+
+        def currentHash = timeout(time: 1, unit: 'MINUTES') {
+            sh(
+                script: "md5sum package-lock.json 2>/dev/null | cut -d' ' -f1 || echo 'none'",
+                 returnStdout: true
+            ).trim()
+        }
+
+        def needsInstall = true
+
+        if (fileExists(hashFile)) {
+            def savedHash = readFile(hashFile).trim()
+            if (savedHash == currentHash && fileExists('node_modules/@playwright')) {
+                needsInstall = false
+                echo "✅ Dependencies up to date (hash match: ${currentHash})"
+            }
+        }
+
+        if (!needsInstall) {
+            return
+        }
+
+        echo '📦 Installing npm dependencies (hash changed or first run)...'
+        def exitCode = timeout(time: 15, unit: 'MINUTES') {
+            sh(
+                script: '''
+                    if [ -f "package-lock.json" ]; then
+                        npm ci --prefer-offline --no-audit --no-fund --silent 2>&1 | tail -15
+                    else
+                        npm install --prefer-offline --no-audit --no-fund --silent 2>&1 | tail -15
+                    fi
+                ''',
+                returnStatus: true
+            )
+        }
+
+        if (exitCode != 0) {
+            error("NPM installation failed with exit code: ${exitCode}")
+        }
+
+        writeFile(file: hashFile, text: currentHash)
+        echo '✅ Dependencies installed successfully (hash saved)'
+    }
+
+    def createMetadata() {
+        echo '📝 Creating metadata...'
+        echo "   Build: ${env.BUILD_NUMBER}"
+        echo "   Job: ${env.JOB_NAME}"
+
+        // New Requirement: include suite_testcase JSON in metadata
+        def metadataContent = [
+            tenantId: params.tenantId ?: 'N/A',
+            applicationId: params.applicationId ?: 'N/A',
+            test_run_id: params.test_run_id ?: 'N/A',
+            test_execution_id: params.test_execution_id ?: 'N/A',
+            test_execution_request_id: params.test_execution_request_id ?: 'N/A',
+            branch_name: params.branch_name ?: 'N/A',
+            commit_id: params.commit_id ?: 'N/A',
+            suite_testcase: readJSON(text: params.suite_testcase.trim()),
+            browser: params.browser,
+            environment: params.environment,
+            s3_prefix: params.s3_prefix,
+            jenkins_build_id: env.BUILD_ID,
+            jenkins_build_number: env.BUILD_NUMBER,
+            jenkins_job_name: env.JOB_NAME,
+            jenkins_build_url: env.BUILD_URL
+        ]
+        writeJSON file: env.METADATA_FILE, json: metadataContent, pretty: 4
+
+        // Verify file was created
+        if (!fileExists(env.METADATA_FILE)) {
+            error("❌ Failed to create metadata file: ${env.METADATA_FILE}")
+        }
+        
+        echo "✅ Metadata file created: ${env.METADATA_FILE}"
+        sh "cat ${env.METADATA_FILE}"
+        sh "ls -lh ${env.METADATA_FILE}"
+        
+        // Stash the metadata
+        try {
+            stash name: 'metadata', includes: env.METADATA_FILE
+            echo "✅ Metadata stashed successfully as 'metadata'"
+        } catch (Exception e) {
+            error("❌ Failed to stash metadata: ${e.message}\nStack: ${e.stackTrace}")
+        }
+    }
+
+    // New Requirement: execute all suites from suite_testcase JSON sequentially; single ZIP upload
+    def runSuiteTestcases() {
+        def suiteTestcase = parseSuiteTestcase()
+        def suiteNames = suiteTestcase.keySet() as List
+        echo "🧪 Running suites: ${suiteNames.join(', ')}"
+
+        withCredentials([
+            string(credentialsId: 'PASSWORD', variable: 'PASSWORD'),
+            string(credentialsId: 'BASE_URL', variable: 'BASE_URL'),
+            string(credentialsId: 'USER_NAME', variable: 'USER_NAME')
+        ]) {
+            def datetime = sh(script: "date +'%Y%m%d_%H%M%S'",  returnStdout: true).trim()
+            def label = suiteNames.size() == 1 ? suiteNames[0] : suiteNames.join('-')
+            def suiteDir = "${label}_${datetime}"
+            def zipName = "${label}_${datetime}.zip"
+
+            env.SUITE_DIR = suiteDir
+            env.ZIP_NAME = zipName
+
+            def overallExitCode = 0
+            suiteTestcase.each { suite, testcases ->
+                echo "🧪 Running suite: ${suite}"
+                def testPaths = buildPlaywrightTestPaths(suite, testcases as List)
+                def exitCode = runPlaywrightTests(suite, testPaths, PASSWORD, BASE_URL, USER_NAME)
+                createTestStatus(suite, exitCode)
+                if (exitCode != 0) {
+                    overallExitCode = exitCode
+                }
+            }
+
+            echo "Test exit code: ${overallExitCode}"
+            env.TEST_EXIT_CODE = "${overallExitCode}"
+
+            packageResultsOptimized(suiteDir, zipName, suiteNames)
+
+            if (overallExitCode != 0) {
+                echo '⚠️ Tests failed - marking build as UNSTABLE'
+                currentBuild.result = 'UNSTABLE'
+            }
+        }
+    }
+
+    // New Requirement: run Playwright with dynamic test paths
+    def runPlaywrightTests(String suite, List testPaths, String password, String baseUrl, String userName) {
+        def projectName = "${suite} - ${params.browser}"
+        def workersArg = params.workers ? "--workers=${params.workers}" : ''
+        def pathsArg = testPaths.join(' ')
+
+        def exitCode = timeout(time: 90, unit: 'MINUTES') {
+            withEnv([
+                "PLAYWRIGHT_BROWSERS_PATH=${env.PLAYWRIGHT_BROWSERS_PATH ?: '/ms-playwright'}",
+                "PASSWORD=${password}",
+                "BASE_URL=${baseUrl}",
+                "USER_NAME=${userName}"
+            ]) {
+                def logPid = startPeriodicLogging()
+
+                try {
+                    exitCode = sh(
+                        script: """
+                            set +e
+                            timeout 5400 ./node_modules/.bin/cross-env \
+                                SUITE="${suite}" \
+                                BROWSER="${params.browser}" \
+                                PASSWORD="\$PASSWORD" \
+                                BASE_URL="\$BASE_URL" \
+                                USER_NAME="\$USER_NAME" \
+                                IS_REGRESSION=false \
+                                ./node_modules/.bin/playwright test \
+                                ${pathsArg} \
+                                --project="${projectName}" \
+                                ${workersArg}
+                            EXIT_CODE=\$?
+                            exit \$EXIT_CODE
+                        """,
+                        returnStatus: true
+                    )
+                } catch (Exception e) {
+                    echo "⚠️ Test execution error: ${e.message}"
+                    exitCode = 1
+                } finally {
+                    stopPeriodicLogging(logPid)
+                }
+            }
+        }
+
+        return exitCode
+    }
+
+    def createTestStatus(String suite, int exitCode) {
+        echo "🔍 Attempting to unstash metadata for ${suite}..."
+        echo "   Build: ${env.BUILD_NUMBER}"
+        echo "   Job: ${env.JOB_NAME}"
+        
+        // Check if metadata file already exists (might be from previous stage or parallel execution)
+        def metadataExists = fileExists(env.METADATA_FILE)
+        echo "   Metadata file exists before unstash: ${metadataExists}"
+        
+        if (!metadataExists) {
+            try {
+                echo "   Attempting to unstash metadata..."
+                unstash 'metadata'
+                echo "✅ Metadata unstashed successfully"
+            } catch (Exception e) {
+                echo "❌ CRITICAL: Failed to unstash metadata"
+                echo "   Error: ${e.message}"
+                echo "   Error class: ${e.class.name}"
+                echo "   This indicates the 'Create Metadata' stage may have failed"
+                echo "   or the stash 'metadata' does not exist or is corrupted"
+                
+                // Check if file exists now (maybe unstash partially worked)
+                if (fileExists(env.METADATA_FILE)) {
+                    echo "   ⚠️ Metadata file exists despite unstash error - continuing"
+                } else {
+                    error("❌ Cannot proceed without metadata - metadata unstash failed: ${e.message}")
+                }
+            }
+        } else {
+            echo "✅ Metadata file already exists, skipping unstash"
+        }
+        
+        // Verify the file actually exists
+        if (!fileExists(env.METADATA_FILE)) {
+            error("❌ Metadata file ${env.METADATA_FILE} not found - cannot proceed")
+        }
+        
+        echo "✅ Metadata file verified: ${env.METADATA_FILE}"
+        sh "cat ${env.METADATA_FILE}"
+
+        def statusFile = suite ? "test_status_${suite}.json" : 'test_status.json'
+
+        sh """
+            cat > ${statusFile} <<'STATUS_EOF'
+    {
+        ${suite ? "\"suite\": \"${suite}\"," : ''}
+        "test_exit_code": ${exitCode},
+        "test_status": "${exitCode == 0 ? 'PASSED' : 'FAILED'}",
+        "tests_executed_at": "\$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    }
+    STATUS_EOF
+        """
+    }
+
+    def packageResultsOptimized(String suiteDir, String zipName, def suites) {
+        def suiteList = (suites instanceof List) ? suites : [suites]
+        echo "📦 Packaging results for ${suiteList.join(', ')}..."
+        echo "   Suite directory: ${suiteDir}"
+        echo "   Zip file name: ${zipName}"
+
+        // New Requirement: copy reports for each executed suite into a single ZIP
+        def reportCopyCommands = suiteList.collect { suite ->
+            if (suiteList.size() == 1) {
+                """
+            ([ -d "reports/${suite}/html-report" ] && cp -r "reports/${suite}/html-report" "${suiteDir}/" || true) &
+            PID_HTML_${suite}=\$!
+
+            ([ -f "reports/${suite}/results.json" ] && cp "reports/${suite}/results.json" "${suiteDir}/" || true) &
+            PID_JSON_${suite}=\$!
+                """
+            } else {
+                """
+            ([ -d "reports/${suite}/html-report" ] && mkdir -p "${suiteDir}/${suite}" && cp -r "reports/${suite}/html-report" "${suiteDir}/${suite}/" || true) &
+            PID_HTML_${suite}=\$!
+
+            ([ -f "reports/${suite}/results.json" ] && mkdir -p "${suiteDir}/${suite}" && cp "reports/${suite}/results.json" "${suiteDir}/${suite}/" || true) &
+            PID_JSON_${suite}=\$!
+                """
+            }
+        }.join('\n')
+
+        def reportWaitCommands = suiteList.collect { suite ->
+            "wait PID_HTML_${suite} PID_JSON_${suite} 2>/dev/null || true"
+        }.join('\n            ')
+
+        sh """
+            set -e
+
+            echo "📁 Creating suite directory: ${suiteDir}"
+            mkdir -p "${suiteDir}"
+
+            ${reportCopyCommands}
+
+            (cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true) &
+            PID3=\$!
+
+            (cp test_status*.json "${suiteDir}/" 2>/dev/null || true) &
+            PID4=\$!
+
+            if [ -d "test-results" ] && [ "\$(ls -A test-results 2>/dev/null)" ]; then
+                mkdir -p "${suiteDir}/test-results"
+                (cp -r test-results/* "${suiteDir}/test-results/" 2>/dev/null || true) &
+                PID5=\$!
+            fi
+
+            ${reportWaitCommands}
+            wait \$PID3 \$PID4 2>/dev/null || true
+            [ -n "\${PID5:-}" ] && wait \$PID5 2>/dev/null || true
+
+            if command -v pigz >/dev/null 2>&1; then
+                echo "Using pigz for parallel compression..."
+                tar -cf - "${suiteDir}" | pigz -6 > "${zipName}"
+            else
+                zip -r -q -6 "${zipName}" "${suiteDir}"
+            fi
+
+            echo "🔍 Verifying zip file creation..."
+            if [ ! -f "${zipName}" ]; then
+                echo "❌ Failed to create zip: ${zipName}"
+                echo "📂 Current directory contents:"
+                ls -lah
+                echo "📂 Looking for zip files:"
+                ls -lah *.zip 2>/dev/null || echo "No zip files found in current directory"
+                exit 1
+            fi
+
+            echo "✅ Zip created successfully: ${zipName}"
+            ls -lh "${zipName}"
+            echo "📊 Zip file size: \$(du -h '${zipName}' | cut -f1)"
+
+            rm -rf "${suiteDir}"
+            echo "✅ Cleaned up temporary directory: ${suiteDir}"
+        """
+    }
+
+    def uploadToS3Optimized(String zipFile) {
+        if (!zipFile || zipFile == 'N/A') {
+            echo '❌ No zip file specified for upload'
+            currentBuild.result = 'UNSTABLE'
+            return
+        }
+
+        if (!fileExists(zipFile)) {
+            echo "❌ Zip file not found: ${zipFile}"
+            currentBuild.result = 'UNSTABLE'
+            return
+        }
+
+        echo "✅ Zip file found: ${zipFile}"
+
+        def prefix = (params.s3_prefix ?: '')
+            .replaceAll('^/+', '')
+            .replaceAll('/+$', '')
+
+        def s3Path = prefix ? 
+            "s3://taas-qa-ai/${prefix}/${zipFile}" : 
+            "s3://taas-qa-ai/${zipFile}"
+
+        withCredentials([
+            string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+            string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+        ]) {
+
+            withEnv([
+                "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}",
+                "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}",
+                "AWS_REGION=${env.AWS_REGION}"
+            ]) {
+
+                echo "📤 Uploading to: ${s3Path}"
+
+                try {
+                    retry(3) {
+                        sh """
+                            aws s3 cp '${zipFile}' '${s3Path}' \
+                                --region '${env.AWS_REGION}' \
+                                --only-show-errors
+                        """
+                    }
+
+                    echo "✅ Upload successful → ${s3Path}"
+
+                } catch (Exception e) {
+                    echo "❌ Upload failed after retries: ${e.message}"
+                    currentBuild.result = 'UNSTABLE'
+                }
+            }
+        }
+    }
+
+    def printSummary() {
+        def buildStatus = currentBuild.result ?: 'SUCCESS'
+        def testExitCode = env.TEST_EXIT_CODE ?: 'N/A'
+        def zipFile = env.ZIP_NAME ?: env.FINAL_ZIP_NAME ?: 'N/A'
+        def duration = currentBuild.durationString.replace(' and counting', '')
+
+        def testStatus = 'N/A'
+        if (testExitCode != 'N/A') {
+            testStatus = (testExitCode == '0') ? '✅ PASSED' : '❌ FAILED'
+        }
+
+        def s3Location = 'N/A'
+        if (zipFile != 'N/A') {
+            def prefix = params.s3_prefix ?: ''
+            prefix = prefix.replaceAll('^/+', '/').replaceAll('/+$', '')
+            s3Location = "s3://taas-qa-ai${prefix}/${zipFile}"
+        }
+
+        echo """
+    ╔════════════════════════════════════════════════════════════
+    ║ 📋 TaaS Execution Summary
+    ╠════════════════════════════════════════════════════════════
+    ║ Build Status:    ${buildStatus}
+    ║ Test Results:    ${testStatus}
+    ║ Duration:        ${duration}
+    ║
+    ║ Test Configuration:
+    ║ - Branch:        ${params.branch_name ?: 'N/A'}
+    ║ - Commit:        ${params.commit_id ?: 'N/A'}
+    ║ - Suites:        ${params.suite_testcase ?: 'N/A'}
+    ║ - Browser:       ${params.browser}
+    ║ - Environment:   ${params.environment}
+    ║ - Test Run ID:   ${params.test_run_id ?: 'N/A'}
+    ║
+    ║ 📦 Artifacts:
+    ║ - Zip File:      ${zipFile}
+    ║ - S3 Location:   ${s3Location}
+    ║
+    ║ 🔗 Build URL:     ${env.BUILD_URL}
+    ╚════════════════════════════════════════════════════════════
+    """
+    }

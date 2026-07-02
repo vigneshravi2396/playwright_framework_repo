@@ -1,0 +1,15 @@
+
+# Playwright
+node_modules/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/allure-report/
+/allure-results/
+/screenshots/
+/reports/
+/src/customRecorder/recorded-elements.json
+/.playwright-report/
+environment/.env*
+!environment/.env.example

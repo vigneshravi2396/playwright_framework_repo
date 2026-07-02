@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    // ▶️ The version of JavaScript the TypeScript will output (after compiling)
+    "target": "ESNext", // Use latest JavaScript features
+
+    // 📦 How modules are loaded — CommonJS is standard for Node.js
+    "module": "ESNext",
+
+    // 🔒 Turns on all strict type-checking (highly recommended)
+    "strict": true,
+
+    // 📂 How TypeScript finds modules when you import — "Node" mimics Node.js behavior
+    "moduleResolution": "Node",
+
+    // 🔄 Allows `import x from 'y'` even if the module uses `module.exports = y`
+    "esModuleInterop": true,
+
+    // 🚫 Skip checking the types of libraries inside `node_modules`
+    "skipLibCheck": true, // Speeds up type checking
+
+    // 🧠 Type definitions to include (e.g., Playwright and Node.js types)
+    "types": ["node", "playwright"],
+
+    // 🚫 Don't generate `.js` files from `.ts` — useful when using TS for type-checking only
+    "noEmit": true, // Just check types, don't output files
+
+    // 🧭 Sets the root for module imports
+    "baseUrl": ".", // Now you can use relative imports like "@/utils/helper"
+
+    // 🔗 Custom import shortcuts (called "path mapping")
+    "paths": {
+      "@pages/*": ["src/pages/*"],   // So you can do: import x from '@pages/LoginPage'
+      "@utils/*": ["src/utils/*"]    // import helper from '@utils/dateFormatter'
+    }
+  },
+
+  // 📂 Which folders/files to include in type checking
+  "include": [
+    "tests/**/*",        // Include all files in tests folder
+    "src/**/*",          // Include all files in src folder  
+    "environment/**/*",  // Include all files in environment folder
+    "*.config.ts",        // Include config files like playwright.config.ts
+    "RecordingFlows/**/*",
+    "src/customRecorder/**/*"  // Include custom recorder files
+  ]
+}
