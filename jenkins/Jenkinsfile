@@ -354,7 +354,7 @@
                 extensions: defaultGitCloneExtensions(),
                 userRemoteConfigs: [[
                     url: clientUrl,
-                    credentialsId: 'framework-crds'
+                    credentialsId: 'client-crds'
                 ]]
             ])
         }
