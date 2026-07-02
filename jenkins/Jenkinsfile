@@ -136,8 +136,8 @@
                             ls -la
                             find . -maxdepth 3
                         '''
-                        echo '⏳ Sleeping 300s for manual workspace inspection...'
-                        sleep(time: 300, unit: 'SECONDS')
+                        echo '⏳ Waiting 2 seconds...'
+                        sleep(time: 2, unit: 'SECONDS')
                     }
                 }
             }
