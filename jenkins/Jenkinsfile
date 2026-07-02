@@ -261,10 +261,45 @@
 
     // Two-repository checkout: framework repo + client tests repo
     def checkoutRepository() {
+        prepareWorkspaceForCheckout()
         checkoutFrameworkRepository()
         checkoutClientTestsRepository()
         materializeTestsFromClientRepository()
         validateTestsDirectory()
+    }
+
+    def prepareWorkspaceForCheckout() {
+        sh '''
+            set +e
+            echo '🧹 Preparing workspace for checkout...'
+
+            if command -v docker >/dev/null 2>&1; then
+                docker run --rm \
+                    -v "$(pwd):/ws" \
+                    -w /ws \
+                    --user root \
+                    alpine:3.19 \
+                    sh -c 'rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/.npm-install-hash' \
+                    2>/dev/null || \
+                docker run --rm \
+                    -v "$(pwd):/ws" \
+                    -w /ws \
+                    --user root \
+                    playwright-taas:v1.55.0-chrome \
+                    sh -c 'rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/.npm-install-hash' \
+                    2>/dev/null || true
+            fi
+
+            chmod -R u+w . 2>/dev/null || true
+            rm -rf node_modules test-results reports playwright-report blob-report client-tests .npm-install-hash 2>/dev/null || true
+            find . -maxdepth 1 -name '*.zip' -exec rm -f {} + 2>/dev/null || true
+        '''
+    }
+
+    def defaultGitCloneExtensions() {
+        return [
+            [$class: 'CloneOption', depth: 1, shallow: true, noTags: true, timeout: 10]
+        ]
     }
 
     def checkoutFrameworkRepository() {
@@ -292,10 +327,7 @@
             $class: 'GitSCM',
             branches: [[name: branchSpec]],
             doGenerateSubmoduleConfigurations: false,
-            extensions: scm.extensions ?: [
-                [$class: 'CleanBeforeCheckout'],
-                [$class: 'CloneOption', depth: 1, shallow: true, noTags: true, timeout: 10]
-            ],
+            extensions: defaultGitCloneExtensions(),
             userRemoteConfigs: [[
                 url: 'https://github.com/vigneshravi2396/playwright_framework_repo',
                 credentialsId: 'framework-crds'
@@ -319,10 +351,7 @@
                 $class: 'GitSCM',
                 branches: [[name: "*/${clientBranch}"]],
                 doGenerateSubmoduleConfigurations: false,
-                extensions: [
-                    [$class: 'CleanBeforeCheckout'],
-                    [$class: 'CloneOption', depth: 1, shallow: true, noTags: true, timeout: 10]
-                ],
+                extensions: defaultGitCloneExtensions(),
                 userRemoteConfigs: [[
                     url: clientUrl,
                     credentialsId: 'framework-crds'
@@ -451,12 +480,7 @@
     }
 
     def cleanWorkspace() {
-        sh '''
-            set +e
-            chmod -R u+w . 2>/dev/null || true
-            rm -rf test-results reports node_modules playwright-report blob-report .npm-install-hash 2>/dev/null || true
-            find . -maxdepth 1 -name '*.zip' -exec rm -f {} + 2>/dev/null || true
-        '''
+        prepareWorkspaceForCheckout()
         cleanWs(
             deleteDirs: true,
             disableDeferredWipeout: true,
