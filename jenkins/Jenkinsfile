@@ -866,8 +866,7 @@
                 echo "ERROR: Playwright JSON reporter did not generate test-results/results.json"
                 exit 1
             fi
-            mkdir -p "${suiteDir}/test-results"
-            cp test-results/results.json "${suiteDir}/test-results/results.json"
+            cp test-results/results.json "${suiteDir}/results.json"
 
             if [ -d "playwright-report" ]; then
                 cp -r playwright-report "${suiteDir}/playwright-report"
