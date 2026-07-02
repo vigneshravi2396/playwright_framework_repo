@@ -5,7 +5,7 @@
             // New Requirement: branch and commit parameters for targeted checkout
             string(
                 name: 'branch_name',
-                defaultValue: '',
+                defaultValue: 'main',
                 description: 'Git branch to checkout'
             )
             string(
@@ -15,12 +15,12 @@
             )
             string(
                 name: 'client_repo_url',
-                defaultValue: '',
+                defaultValue: 'https://github.com/qadence-ai/boilerplate-qa.git',
                 description: 'Client tests repository URL (e.g. https://github.com/company/client-tests.git)'
             )
             string(
                 name: 'client_branch',
-                defaultValue: 'main',
+                defaultValue: 'vignesh_test_poc_new',
                 description: 'Branch to checkout from the client tests repository'
             )
             string(
@@ -308,19 +308,19 @@
                     -w /ws \
                     --user root \
                     alpine:3.19 \
-                    sh -c 'rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/.npm-install-hash' \
+                    sh -c 'rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/tests /ws/.npm-install-hash' \
                     2>/dev/null || \
                 docker run --rm \
                     -v "$(pwd):/ws" \
                     -w /ws \
                     --user root \
                     playwright-taas:v1.55.0-chrome \
-                    sh -c 'rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/.npm-install-hash' \
+                    sh -c 'rm -rf /ws/node_modules /ws/test-results /ws/reports /ws/playwright-report /ws/blob-report /ws/client-tests /ws/tests /ws/.npm-install-hash' \
                     2>/dev/null || true
             fi
 
             chmod -R u+w . 2>/dev/null || true
-            rm -rf node_modules test-results reports playwright-report blob-report client-tests .npm-install-hash 2>/dev/null || true
+            rm -rf node_modules test-results reports playwright-report blob-report client-tests tests .npm-install-hash 2>/dev/null || true
             find . -maxdepth 1 -name '*.zip' -exec rm -f {} + 2>/dev/null || true
         '''
     }
@@ -403,13 +403,24 @@
 
     def materializeTestsFromClientRepository() {
         sh '''
-            set -eu
+            set -e
 
             if [ ! -d "client-tests/tests" ]; then
                 echo "ERROR: client-tests/tests not found in client repository"
                 exit 1
             fi
 
+            if [ -d tests ] && command -v docker >/dev/null 2>&1; then
+                docker run --rm \
+                    -v "$(pwd):/ws" \
+                    -w /ws \
+                    --user root \
+                    alpine:3.19 \
+                    sh -c 'rm -rf /ws/tests' \
+                    2>/dev/null || true
+            fi
+
+            chmod -R u+w tests 2>/dev/null || true
             rm -rf tests
             cp -a client-tests/tests ./tests
         '''
