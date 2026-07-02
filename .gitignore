@@ -13,3 +13,6 @@ node_modules/
 /.playwright-report/
 environment/.env*
 !environment/.env.example
+
+# Playwright
+/playwright/.auth/
