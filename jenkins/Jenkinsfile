@@ -382,27 +382,20 @@
 
         sh "rm -rf ${clientTestsDir}"
 
-        withEnv([
-            "CLIENT_REPO_URL=${clientUrl}",
-            "CLIENT_REPO_BRANCH=${clientBranch}",
-            "CLIENT_GIT_USERNAME=${params.client_username.trim()}",
-            "CLIENT_GIT_PASSWORD=${gitPassword}"
-        ]) {
-            sh(label: 'Clone client repository', script: '''
+        def repoHostPath = clientUrl.replaceFirst('(?i)^https://', '')
+        def safeBranch = clientBranch.replace("'", "'\\''")
+        def safeHostPath = repoHostPath.replace("'", "'\\''")
+        def authUser = repoHostPath.toLowerCase().startsWith('github.com/')
+            ? 'x-access-token'
+            : params.client_username.trim().replace("'", "'\\''")
+
+        withEnv(["CLIENT_GIT_PASSWORD=${gitPassword}"]) {
+            sh(label: 'Clone client repository', script: """
                 set -e
                 set +x
-
-                repo_path="${CLIENT_REPO_URL#https://}"
-                repo_path="${repo_path#http://}"
-
-                if printf '%s' "$repo_path" | grep -qi '^github\\.com/'; then
-                    clone_url="https://x-access-token:${CLIENT_GIT_PASSWORD}@${repo_path}"
-                else
-                    clone_url="https://${CLIENT_GIT_USERNAME}:${CLIENT_GIT_PASSWORD}@${repo_path}"
-                fi
-
-                git clone --depth 1 --no-tags --branch "$CLIENT_REPO_BRANCH" "$clone_url" client-tests
-            ''')
+                git clone --depth 1 --no-tags --branch '${safeBranch}' \\
+                    "https://${authUser}:\${CLIENT_GIT_PASSWORD}@${safeHostPath}" client-tests
+            """)
         }
 
         echo "✅ Client repository checked out: ${clientUrl} @ ${clientBranch}"
