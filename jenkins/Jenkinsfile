@@ -372,7 +372,8 @@
         if (!params.client_username?.trim()) {
             error('client_username is mandatory')
         }
-        if (!params.client_password?.trim()) {
+        String gitPassword = params.client_password.toString().trim()
+        if (!gitPassword) {
             error('client_password is mandatory')
         }
 
@@ -385,7 +386,7 @@
             "CLIENT_REPO_URL=${clientUrl}",
             "CLIENT_REPO_BRANCH=${clientBranch}",
             "CLIENT_GIT_USERNAME=${params.client_username.trim()}",
-            "CLIENT_GIT_PASSWORD=${params.client_password}"
+            "CLIENT_GIT_PASSWORD=${gitPassword}"
         ]) {
             sh '''
                 set -eu
