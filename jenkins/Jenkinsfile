@@ -228,9 +228,11 @@
                 script {
                     printSummary()
                     try {
-                        echo '🧹 Cleaning workspace after pipeline execution...'
-                        cleanWorkspace()
-                        echo '✅ Workspace cleaned'
+                        node('built-in') {
+                            echo '🧹 Cleaning workspace after pipeline execution...'
+                            cleanWorkspace()
+                            echo '✅ Workspace cleaned'
+                        }
                     } catch (Exception e) {
                         echo "⚠️ Final workspace cleanup failed: ${e.message}"
                     }
@@ -364,7 +366,7 @@
 
     def materializeTestsFromClientRepository() {
         sh '''
-            set -euo pipefail
+            set -eu
 
             if [ ! -d "client-tests/tests" ]; then
                 echo "ERROR: client-tests/tests not found in client repository"
