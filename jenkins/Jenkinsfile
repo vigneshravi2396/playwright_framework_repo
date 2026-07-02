@@ -13,6 +13,16 @@
                 defaultValue: '',
                 description: 'Optional commit SHA to checkout after branch'
             )
+            string(
+                name: 'client_repo_url',
+                defaultValue: '',
+                description: 'Client tests repository URL (e.g. https://github.com/company/client-tests.git)'
+            )
+            string(
+                name: 'client_branch',
+                defaultValue: 'main',
+                description: 'Branch to checkout from the client tests repository'
+            )
             // New Requirement: suite_testcase JSON mapping suites to test files
             text(
                 name: 'suite_testcase',
@@ -249,40 +259,111 @@
     // OPTIMIZED UTILITY FUNCTIONS - ALL FIXED
     // ============================================================================
 
-    // Git checkout via Jenkins checkout step — reuses job SCM URL, credentials, and extensions.
-    // Replaces shell "git checkout" commands to avoid dubious-ownership errors in Docker agents.
+    // Two-repository checkout: framework repo + client tests repo
     def checkoutRepository() {
+        checkoutFrameworkRepository()
+        checkoutClientTestsRepository()
+        materializeTestsFromClientRepository()
+        validateTestsDirectory()
+    }
+
+    def checkoutFrameworkRepository() {
         def branch = params.branch_name?.trim()
         def commit = params.commit_id?.trim()
 
-        // No branch override — use the job's configured SCM as-is
         if (!branch) {
             checkout scm
+            echo '✅ Framework repository checked out via job SCM (no branch/commit override)'
             return
         }
 
-        // branch_name only: checkout the specified branch through Git SCM plugin
-        checkout buildGitScmConfig(branch)
-        echo "✅ Checked out branch: ${branch}"
+        checkout buildFrameworkGitScmConfig(branch)
+        echo "✅ Framework repository checked out at branch: ${branch}"
 
-        // branch_name + commit_id: second checkout pins the workspace to the exact commit
         if (commit) {
-            checkout buildGitScmConfig(commit)
-            echo "✅ Checked out commit: ${commit}"
+            checkout buildFrameworkGitScmConfig(commit)
+            echo "✅ Framework repository pinned to commit: ${commit}"
         }
     }
 
-    // Builds a GitSCM config from the job's existing scm, overriding only the branch/commit ref
-    def buildGitScmConfig(String ref) {
+    def buildFrameworkGitScmConfig(String ref) {
         def branchSpec = (ref ==~ /^[0-9a-fA-F]{7,40}$/) ? ref : "*/${ref}"
         return [
             $class: 'GitSCM',
             branches: [[name: branchSpec]],
-            doGenerateSubmoduleConfigurations: scm.doGenerateSubmoduleConfigurations,
-            extensions: scm.extensions ?: [],
-            submoduleCfg: scm.submoduleCfg,
-            userRemoteConfigs: scm.userRemoteConfigs
+            doGenerateSubmoduleConfigurations: false,
+            extensions: scm.extensions ?: [
+                [$class: 'CleanBeforeCheckout'],
+                [$class: 'CloneOption', depth: 1, shallow: true, noTags: true, timeout: 10]
+            ],
+            userRemoteConfigs: [[
+                url: 'https://github.com/vigneshravi2396/playwright_framework_repo',
+                credentialsId: 'framework-crds'
+            ]]
         ]
+    }
+
+    def checkoutClientTestsRepository() {
+        def clientUrl = params.client_repo_url?.trim()
+        if (!clientUrl) {
+            error('client_repo_url is mandatory')
+        }
+
+        def clientBranch = params.client_branch?.trim() ?: 'main'
+        def clientTestsDir = 'client-tests'
+
+        sh "rm -rf ${clientTestsDir}"
+
+        dir(clientTestsDir) {
+            checkout([
+                $class: 'GitSCM',
+                branches: [[name: "*/${clientBranch}"]],
+                doGenerateSubmoduleConfigurations: false,
+                extensions: [
+                    [$class: 'CleanBeforeCheckout'],
+                    [$class: 'CloneOption', depth: 1, shallow: true, noTags: true, timeout: 10]
+                ],
+                userRemoteConfigs: [[
+                    url: clientUrl,
+                    credentialsId: 'framework-crds'
+                ]]
+            ])
+        }
+
+        echo "✅ Client repository checked out: ${clientUrl} @ ${clientBranch}"
+    }
+
+    def materializeTestsFromClientRepository() {
+        sh '''
+            set -euo pipefail
+
+            if [ ! -d "client-tests/tests" ]; then
+                echo "ERROR: client-tests/tests not found in client repository"
+                exit 1
+            fi
+
+            rm -rf tests
+            cp -a client-tests/tests ./tests
+        '''
+
+        echo '✅ Copied client-tests/tests → tests/'
+    }
+
+    def validateTestsDirectory() {
+        def status = sh(
+            script: '''
+                set -e
+                test -d tests
+                test "$(find tests -mindepth 1 -print -quit | wc -l)" -gt 0
+            ''',
+            returnStatus: true
+        )
+
+        if (status != 0) {
+            error('tests/ directory is missing or empty after client repository checkout')
+        }
+
+        echo '✅ tests/ directory verified'
     }
 
     // New Requirement: parse suite_testcase JSON parameter
