@@ -126,6 +126,21 @@
                     }
                 }
             }
+
+            stage('Debug Workspace') {
+                steps {
+                    script {
+                        echo '🔍 Inspecting workspace structure...'
+                        sh '''
+                            pwd
+                            ls -la
+                            find . -maxdepth 3
+                        '''
+                        echo '⏳ Sleeping 300s for manual workspace inspection...'
+                        sleep(time: 300, unit: 'SECONDS')
+                    }
+                }
+            }
             
             stage('Validate Suite') {
                 steps {
@@ -228,11 +243,13 @@
                 script {
                     printSummary()
                     try {
-                        node('built-in') {
-                            echo '🧹 Cleaning workspace after pipeline execution...'
-                            cleanWorkspace()
-                            echo '✅ Workspace cleaned'
-                        }
+                        // cleanWorkspace() — temporarily disabled for debugging
+                        // node('built-in') {
+                        //     echo '🧹 Cleaning workspace after pipeline execution...'
+                        //     cleanWorkspace()
+                        //     echo '✅ Workspace cleaned'
+                        // }
+                        echo '⚠️ Workspace cleanup skipped for debugging.'
                     } catch (Exception e) {
                         echo "⚠️ Final workspace cleanup failed: ${e.message}"
                     }
