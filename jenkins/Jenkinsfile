@@ -737,6 +737,14 @@
                 } finally {
                     stopPeriodicLogging(logPid)
                 }
+
+                sh '''
+                    echo "===== Checking Playwright Reports ====="
+                    find . -name "results.json" || true
+                    find . -name "*.json" || true
+                    ls -R test-results || true
+                    ls -R playwright-report || true
+                '''
             }
         }
 
@@ -842,15 +850,25 @@
             (cp test_status*.json "${suiteDir}/" 2>/dev/null || true) &
             PID4=\$!
 
-            if [ -d "test-results" ] && [ "\$(ls -A test-results 2>/dev/null)" ]; then
-                mkdir -p "${suiteDir}/test-results"
-                (cp -r test-results/* "${suiteDir}/test-results/" 2>/dev/null || true) &
-                PID5=\$!
+            if command -v realpath >/dev/null 2>&1; then
+                RESULTS_JSON_PATH="\$(realpath test-results/results.json 2>/dev/null || true)"
+            else
+                RESULTS_JSON_PATH="\$(pwd)/test-results/results.json"
+            fi
+            echo "results.json absolute path: \${RESULTS_JSON_PATH}"
+            if [ ! -f "test-results/results.json" ]; then
+                echo "ERROR: Playwright JSON reporter did not generate test-results/results.json"
+                exit 1
+            fi
+            mkdir -p "${suiteDir}/test-results"
+            cp test-results/results.json "${suiteDir}/test-results/results.json"
+
+            if [ -d "playwright-report" ]; then
+                cp -r playwright-report "${suiteDir}/playwright-report"
             fi
 
             ${reportWaitCommands}
             wait \$PID3 \$PID4 2>/dev/null || true
-            [ -n "\${PID5:-}" ] && wait \$PID5 2>/dev/null || true
 
             if command -v pigz >/dev/null 2>&1; then
                 echo "Using pigz for parallel compression..."
