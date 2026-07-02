@@ -23,6 +23,16 @@
                 defaultValue: 'main',
                 description: 'Branch to checkout from the client tests repository'
             )
+            string(
+                name: 'client_username',
+                defaultValue: '',
+                description: 'Username for client repository checkout'
+            )
+            password(
+                name: 'client_password',
+                defaultValue: '',
+                description: 'Password or Personal Access Token for client repository checkout'
+            )
             // New Requirement: suite_testcase JSON mapping suites to test files
             text(
                 name: 'suite_testcase',
@@ -359,23 +369,30 @@
         if (!clientUrl) {
             error('client_repo_url is mandatory')
         }
+        if (!params.client_username?.trim()) {
+            error('client_username is mandatory')
+        }
+        if (!params.client_password?.trim()) {
+            error('client_password is mandatory')
+        }
 
         def clientBranch = params.client_branch?.trim() ?: 'main'
         def clientTestsDir = 'client-tests'
 
         sh "rm -rf ${clientTestsDir}"
 
-        dir(clientTestsDir) {
-            checkout([
-                $class: 'GitSCM',
-                branches: [[name: "*/${clientBranch}"]],
-                doGenerateSubmoduleConfigurations: false,
-                extensions: defaultGitCloneExtensions(),
-                userRemoteConfigs: [[
-                    url: clientUrl,
-                    credentialsId: 'client-crds'
-                ]]
-            ])
+        withEnv([
+            "CLIENT_REPO_URL=${clientUrl}",
+            "CLIENT_REPO_BRANCH=${clientBranch}",
+            "CLIENT_GIT_USERNAME=${params.client_username.trim()}",
+            "CLIENT_GIT_PASSWORD=${params.client_password}"
+        ]) {
+            sh '''
+                set -eu
+                set +x
+                git -c "credential.helper=!f() { echo username=$CLIENT_GIT_USERNAME; echo password=$CLIENT_GIT_PASSWORD; }; f" \
+                    clone --depth 1 --no-tags --branch "$CLIENT_REPO_BRANCH" "$CLIENT_REPO_URL" client-tests
+            '''
         }
 
         echo "✅ Client repository checked out: ${clientUrl} @ ${clientBranch}"
