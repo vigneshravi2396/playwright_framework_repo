@@ -934,6 +934,11 @@
                         export AWS_ACCESS_KEY_ID="\$AWS_ACCESS_KEY_ID"
                         export AWS_SECRET_ACCESS_KEY="\$AWS_SECRET_ACCESS_KEY"
                         export AWS_DEFAULT_REGION="\$AWS_REGION"
+
+                        aws configure list
+
+                        aws s3 ls
+
                         aws s3 cp '${zipFile}' '${s3Path}' \\
                             --region "\$AWS_REGION" \\
                             --only-show-errors
