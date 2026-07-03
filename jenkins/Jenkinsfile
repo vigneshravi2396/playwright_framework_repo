@@ -219,8 +219,8 @@
                         try {
                             uploadToS3Optimized(env.ZIP_NAME)
                         } catch (Exception e) {
-                            currentBuild.result = 'UNSTABLE'
-                            echo "⚠️ S3 upload failed: ${e.message}"
+                            currentBuild.result = 'FAILURE'
+                            error("S3 upload failed: ${e.message}")
                         }
                     }
                 }
@@ -889,14 +889,12 @@
     def uploadToS3Optimized(String zipFile) {
         if (!zipFile || zipFile == 'N/A') {
             echo '❌ No zip file specified for upload'
-            currentBuild.result = 'UNSTABLE'
-            return
+            error('No zip file specified for upload')
         }
 
         if (!fileExists(zipFile)) {
             echo "❌ Zip file not found: ${zipFile}"
-            currentBuild.result = 'UNSTABLE'
-            return
+            error("Zip file not found: ${zipFile}")
         }
 
         echo "✅ Zip file found: ${zipFile}"
@@ -948,8 +946,7 @@
                 echo "✅ Upload successful → ${s3Path}"
 
             } catch (Exception e) {
-                echo "❌ Upload failed after retries: ${e.message}"
-                currentBuild.result = 'UNSTABLE'
+                error("Upload failed after retries: ${e.message}")
             }
         }
     }
