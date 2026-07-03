@@ -921,29 +921,40 @@
             error('aws_secret_access_key is mandatory')
         }
 
-        withEnv([
-            'AWS_ACCESS_KEY_ID=' + awsAccessKeyId,
-            'AWS_SECRET_ACCESS_KEY=' + awsSecretAccessKey,
-            'AWS_DEFAULT_REGION=' + awsRegion
-        ]) {
-            echo "📤 Uploading to: ${s3Path}"
+        def credsFile = '.jenkins-aws-credentials'
+        writeFile(
+            file: credsFile,
+            text: '[default]\n' +
+                'aws_access_key_id = ' + awsAccessKeyId + '\n' +
+                'aws_secret_access_key = ' + awsSecretAccessKey + '\n'
+        )
 
-            try {
-                retry(3) {
-                    sh(label: 'Upload to S3', script: """
-                        set +x
-                        aws configure list
-                        aws s3 cp '${zipFile}' '${s3Path}' \\
-                            --region '${awsRegion}' \\
-                            --only-show-errors
-                    """)
+        try {
+            withEnv([
+                'AWS_SHARED_CREDENTIALS_FILE=' + env.WORKSPACE + '/' + credsFile,
+                'AWS_DEFAULT_REGION=' + awsRegion
+            ]) {
+                echo "📤 Uploading to: ${s3Path}"
+
+                try {
+                    retry(3) {
+                        sh(label: 'Upload to S3', script: """
+                            set +x
+                            aws configure list
+                            aws s3 cp '${zipFile}' '${s3Path}' \\
+                                --region '${awsRegion}' \\
+                                --only-show-errors
+                        """)
+                    }
+
+                    echo "✅ Upload successful → ${s3Path}"
+
+                } catch (Exception e) {
+                    error("Upload failed after retries: ${e.message}")
                 }
-
-                echo "✅ Upload successful → ${s3Path}"
-
-            } catch (Exception e) {
-                error("Upload failed after retries: ${e.message}")
             }
+        } finally {
+            sh "rm -f '${credsFile}'"
         }
     }
 
