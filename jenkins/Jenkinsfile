@@ -639,6 +639,96 @@
         }
     }
 
+    // Preserve each suite's Playwright JSON report before the next suite overwrites test-results/results.json
+    def preserveSuiteResultsJson(String suite) {
+        def resultsFile = 'test-results/results.json'
+        if (!fileExists(resultsFile)) {
+            echo "⚠️ No results.json found for suite '${suite}' — skipping preserve"
+            return
+        }
+
+        sh """
+            mkdir -p "reports/${suite}"
+            cp "${resultsFile}" "reports/${suite}/results.json"
+        """
+        echo "✅ Preserved results.json → reports/${suite}/results.json"
+    }
+
+    // Merge preserved per-suite Playwright JSON reports into a single test-results/results.json
+    def mergePlaywrightResultsJson(List suiteNames) {
+        def mergedSuites = []
+        def mergedErrors = []
+        def mergedStats = [
+            expected: 0,
+            unexpected: 0,
+            skipped: 0,
+            flaky: 0,
+            duration: 0
+        ]
+        def config = null
+        def startTime = null
+        def preservedCount = 0
+
+        suiteNames.each { suite ->
+            def preservedPath = "reports/${suite}/results.json"
+            if (!fileExists(preservedPath)) {
+                echo "⚠️ Missing preserved results for suite '${suite}' — skipping in merge"
+                return
+            }
+
+            def report = readJSON(file: preservedPath)
+            preservedCount++
+
+            if (config == null && report.config != null) {
+                config = report.config
+            }
+
+            if (report.suites instanceof List) {
+                mergedSuites.addAll(report.suites)
+            }
+
+            if (report.errors instanceof List) {
+                mergedErrors.addAll(report.errors)
+            }
+
+            if (report.stats instanceof Map) {
+                ['expected', 'unexpected', 'skipped', 'flaky', 'duration'].each { key ->
+                    if (report.stats[key] != null) {
+                        mergedStats[key] = (mergedStats[key] ?: 0) + (report.stats[key] as Number)
+                    }
+                }
+                if (startTime == null && report.stats.startTime) {
+                    startTime = report.stats.startTime
+                }
+            }
+        }
+
+        if (preservedCount == 0) {
+            if (fileExists('test-results/results.json')) {
+                echo '⚠️ No preserved suite reports — using existing test-results/results.json'
+                return
+            }
+            error('No Playwright results.json files found to merge')
+        }
+
+        if (startTime) {
+            mergedStats.startTime = startTime
+        }
+
+        sh 'mkdir -p test-results'
+        writeJSON(
+            file: 'test-results/results.json',
+            json: [
+                config: config ?: [:],
+                suites: mergedSuites,
+                errors: mergedErrors,
+                stats: mergedStats
+            ],
+            pretty: 4
+        )
+        echo "✅ Merged ${preservedCount} suite report(s) → test-results/results.json"
+    }
+
     // New Requirement: execute all suites from suite_testcase JSON sequentially; single ZIP upload
     def runSuiteTestcases() {
         def suiteTestcase = parseSuiteTestcase()
@@ -665,6 +755,8 @@
                 def testPaths = buildPlaywrightTestPaths(suite, testcases as List)
                 def exitCode = runPlaywrightTests(suite, testPaths, PASSWORD, BASE_URL, USER_NAME)
                 this.createTestStatus(suite, exitCode)
+                // Save this suite's JSON report before the next suite execution overwrites it
+                preserveSuiteResultsJson(suite)
                 if (exitCode != 0) {
                     overallExitCode = exitCode
                 }
@@ -672,6 +764,9 @@
 
             echo "Test exit code: ${overallExitCode}"
             env.TEST_EXIT_CODE = "${overallExitCode}"
+
+            // Combine all preserved suite JSON reports into one results.json for packaging
+            mergePlaywrightResultsJson(suiteNames)
 
             packageResultsOptimized(suiteDir, zipName, suiteNames)
 
