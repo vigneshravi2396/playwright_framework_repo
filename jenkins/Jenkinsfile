@@ -656,54 +656,9 @@
 
     // Merge preserved per-suite Playwright JSON reports into a single test-results/results.json
     def mergePlaywrightResultsJson(List suiteNames) {
-        def mergedSuites = []
-        def mergedErrors = []
-        def mergedStats = [
-            expected: 0,
-            unexpected: 0,
-            skipped: 0,
-            flaky: 0,
-            duration: 0
-        ]
-        def config = null
-        def startTime = null
-        def preservedCount = 0
+        def preservedSuites = suiteNames.findAll { fileExists("reports/${it}/results.json") }
 
-        suiteNames.each { suite ->
-            def preservedPath = "reports/${suite}/results.json"
-            if (!fileExists(preservedPath)) {
-                echo "⚠️ Missing preserved results for suite '${suite}' — skipping in merge"
-                return
-            }
-
-            def report = readJSON(file: preservedPath)
-            preservedCount++
-
-            if (config == null && report.config != null) {
-                config = report.config
-            }
-
-            if (report.suites instanceof List) {
-                mergedSuites.addAll(report.suites)
-            }
-
-            if (report.errors instanceof List) {
-                mergedErrors.addAll(report.errors)
-            }
-
-            if (report.stats instanceof Map) {
-                ['expected', 'unexpected', 'skipped', 'flaky', 'duration'].each { key ->
-                    if (report.stats[key] != null) {
-                        mergedStats[key] = (mergedStats[key] ?: 0) + (report.stats[key] as Number)
-                    }
-                }
-                if (startTime == null && report.stats.startTime) {
-                    startTime = report.stats.startTime
-                }
-            }
-        }
-
-        if (preservedCount == 0) {
+        if (preservedSuites.isEmpty()) {
             if (fileExists('test-results/results.json')) {
                 echo '⚠️ No preserved suite reports — using existing test-results/results.json'
                 return
@@ -711,22 +666,46 @@
             error('No Playwright results.json files found to merge')
         }
 
-        if (startTime) {
-            mergedStats.startTime = startTime
+        // Single-suite: copy preserved report directly (backward compatible)
+        if (preservedSuites.size() == 1) {
+            sh """
+                set -e
+                mkdir -p test-results
+                cp "reports/${preservedSuites[0]}/results.json" test-results/results.json
+            """
+            echo "✅ Single suite report copied → test-results/results.json"
+            return
         }
 
-        sh 'mkdir -p test-results'
-        writeJSON(
-            file: 'test-results/results.json',
-            json: [
-                config: config ?: [:],
-                suites: mergedSuites,
-                errors: mergedErrors,
-                stats: mergedStats
-            ],
-            pretty: 4
-        )
-        echo "✅ Merged ${preservedCount} suite report(s) → test-results/results.json"
+        // Multi-suite: merge via Node to avoid Jenkins writeJSON/LazyMap serialization failures
+        def suitesJs = preservedSuites.collect { "'${it}'" }.join(', ')
+        sh """
+            set -e
+            mkdir -p test-results
+            node -e "
+const fs = require('fs');
+const suites = [${suitesJs}];
+const merged = { suites: [], errors: [], stats: { expected: 0, unexpected: 0, skipped: 0, flaky: 0, duration: 0 } };
+let config = null;
+let startTime = null;
+for (const name of suites) {
+  const report = JSON.parse(fs.readFileSync('reports/' + name + '/results.json', 'utf8'));
+  if (!config && report.config) config = report.config;
+  if (Array.isArray(report.suites)) merged.suites.push(...report.suites);
+  if (Array.isArray(report.errors)) merged.errors.push(...report.errors);
+  if (report.stats) {
+    ['expected', 'unexpected', 'skipped', 'flaky', 'duration'].forEach((key) => {
+      if (report.stats[key] != null) merged.stats[key] += report.stats[key];
+    });
+    if (!startTime && report.stats.startTime) startTime = report.stats.startTime;
+  }
+}
+if (startTime) merged.stats.startTime = startTime;
+merged.config = config || {};
+fs.writeFileSync('test-results/results.json', JSON.stringify(merged, null, 4));
+            "
+        """
+        echo "✅ Merged ${preservedSuites.size()} suite report(s) → test-results/results.json"
     }
 
     // New Requirement: execute all suites from suite_testcase JSON sequentially; single ZIP upload
