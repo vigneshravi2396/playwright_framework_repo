@@ -639,73 +639,37 @@
         }
     }
 
-    // Preserve each suite's Playwright JSON report before the next suite overwrites test-results/results.json
-    def preserveSuiteResultsJson(String suite) {
-        def resultsFile = 'test-results/results.json'
-        if (!fileExists(resultsFile)) {
-            echo "⚠️ No results.json found for suite '${suite}' — skipping preserve"
-            return
-        }
-
-        sh """
-            mkdir -p "reports/${suite}"
-            cp "${resultsFile}" "reports/${suite}/results.json"
-        """
-        echo "✅ Preserved results.json → reports/${suite}/results.json"
+    // Clean Playwright output folders before the next suite so runs do not overwrite each other
+    def cleanPlaywrightOutputDirs() {
+        sh '''
+            rm -rf test-results playwright-report
+        '''
+        echo '🧹 Cleared test-results/ and playwright-report/ for next suite'
     }
 
-    // Merge preserved per-suite Playwright JSON reports into a single test-results/results.json
-    def mergePlaywrightResultsJson(List suiteNames) {
-        def preservedSuites = suiteNames.findAll { fileExists("reports/${it}/results.json") }
-
-        if (preservedSuites.isEmpty()) {
-            if (fileExists('test-results/results.json')) {
-                echo '⚠️ No preserved suite reports — using existing test-results/results.json'
-                return
-            }
-            error('No Playwright results.json files found to merge')
-        }
-
-        // Single-suite: copy preserved report directly (backward compatible)
-        if (preservedSuites.size() == 1) {
-            sh """
-                set -e
-                mkdir -p test-results
-                cp "reports/${preservedSuites[0]}/results.json" test-results/results.json
-            """
-            echo "✅ Single suite report copied → test-results/results.json"
-            return
-        }
-
-        // Multi-suite: merge via Node to avoid Jenkins writeJSON/LazyMap serialization failures
-        def suitesJs = preservedSuites.collect { "'${it}'" }.join(', ')
+    // Preserve full suite report artifacts under reports/<suite>/ before the next suite runs
+    def preserveSuiteReportArtifacts(String suite) {
         sh """
             set -e
-            mkdir -p test-results
-            node -e "
-const fs = require('fs');
-const suites = [${suitesJs}];
-const merged = { suites: [], errors: [], stats: { expected: 0, unexpected: 0, skipped: 0, flaky: 0, duration: 0 } };
-let config = null;
-let startTime = null;
-for (const name of suites) {
-  const report = JSON.parse(fs.readFileSync('reports/' + name + '/results.json', 'utf8'));
-  if (!config && report.config) config = report.config;
-  if (Array.isArray(report.suites)) merged.suites.push(...report.suites);
-  if (Array.isArray(report.errors)) merged.errors.push(...report.errors);
-  if (report.stats) {
-    ['expected', 'unexpected', 'skipped', 'flaky', 'duration'].forEach((key) => {
-      if (report.stats[key] != null) merged.stats[key] += report.stats[key];
-    });
-    if (!startTime && report.stats.startTime) startTime = report.stats.startTime;
-  }
-}
-if (startTime) merged.stats.startTime = startTime;
-merged.config = config || {};
-fs.writeFileSync('test-results/results.json', JSON.stringify(merged, null, 4));
-            "
+            mkdir -p "reports/${suite}"
+
+            if [ -f "test-results/results.json" ]; then
+                cp "test-results/results.json" "reports/${suite}/results.json"
+            else
+                echo "⚠️ No results.json found for suite '${suite}'"
+            fi
+
+            if [ -d "test-results" ]; then
+                rm -rf "reports/${suite}/test-results"
+                cp -r test-results "reports/${suite}/test-results"
+            fi
+
+            if [ -d "playwright-report" ]; then
+                rm -rf "reports/${suite}/html-report"
+                cp -r playwright-report "reports/${suite}/html-report"
+            fi
         """
-        echo "✅ Merged ${preservedSuites.size()} suite report(s) → test-results/results.json"
+        echo "✅ Preserved suite artifacts → reports/${suite}/"
     }
 
     // New Requirement: execute all suites from suite_testcase JSON sequentially; single ZIP upload
@@ -728,14 +692,21 @@ fs.writeFileSync('test-results/results.json', JSON.stringify(merged, null, 4));
             env.ZIP_NAME = zipName
 
             def overallExitCode = 0
+            def isFirstSuite = true
             for (def suite : suiteTestcase.keySet()) {
+                if (!isFirstSuite) {
+                    // Remove previous suite Playwright output before the next run
+                    cleanPlaywrightOutputDirs()
+                }
+                isFirstSuite = false
+
                 def testcases = suiteTestcase[suite]
                 echo "🧪 Running suite: ${suite}"
                 def testPaths = buildPlaywrightTestPaths(suite, testcases as List)
                 def exitCode = runPlaywrightTests(suite, testPaths, PASSWORD, BASE_URL, USER_NAME)
                 this.createTestStatus(suite, exitCode)
-                // Save this suite's JSON report before the next suite execution overwrites it
-                preserveSuiteResultsJson(suite)
+                // Snapshot JSON, html report, and test artifacts for this suite
+                preserveSuiteReportArtifacts(suite)
                 if (exitCode != 0) {
                     overallExitCode = exitCode
                 }
@@ -743,9 +714,6 @@ fs.writeFileSync('test-results/results.json', JSON.stringify(merged, null, 4));
 
             echo "Test exit code: ${overallExitCode}"
             env.TEST_EXIT_CODE = "${overallExitCode}"
-
-            // Combine all preserved suite JSON reports into one results.json for packaging
-            mergePlaywrightResultsJson(suiteNames)
 
             packageResultsOptimized(suiteDir, zipName, suiteNames)
 
@@ -876,67 +844,38 @@ fs.writeFileSync('test-results/results.json', JSON.stringify(merged, null, 4));
         echo "   Suite directory: ${suiteDir}"
         echo "   Zip file name: ${zipName}"
 
-        // New Requirement: copy reports for each executed suite into a single ZIP
-        def reportCopyCommands = suiteList.collect { suite ->
-            if (suiteList.size() == 1) {
-                """
-            ([ -d "reports/${suite}/html-report" ] && cp -r "reports/${suite}/html-report" "${suiteDir}/" || true) &
-            PID_HTML_${suite}=\$!
-
-            ([ -f "reports/${suite}/results.json" ] && cp "reports/${suite}/results.json" "${suiteDir}/" || true) &
-            PID_JSON_${suite}=\$!
-                """
-            } else {
-                """
-            ([ -d "reports/${suite}/html-report" ] && mkdir -p "${suiteDir}/${suite}" && cp -r "reports/${suite}/html-report" "${suiteDir}/${suite}/" || true) &
-            PID_HTML_${suite}=\$!
-
-            ([ -f "reports/${suite}/results.json" ] && mkdir -p "${suiteDir}/${suite}" && cp "reports/${suite}/results.json" "${suiteDir}/${suite}/" || true) &
-            PID_JSON_${suite}=\$!
-                """
-            }
+        // Copy each suite's preserved artifacts into its own folder inside the ZIP root
+        def suiteCopyCommands = suiteList.collect { suite ->
+            """
+            if [ -d "reports/${suite}" ]; then
+                mkdir -p "${suiteDir}/${suite}"
+                [ -f "reports/${suite}/results.json" ] && cp "reports/${suite}/results.json" "${suiteDir}/${suite}/results.json"
+                [ -d "reports/${suite}/html-report" ] && cp -r "reports/${suite}/html-report" "${suiteDir}/${suite}/html-report"
+                [ -d "reports/${suite}/test-results" ] && cp -r "reports/${suite}/test-results" "${suiteDir}/${suite}/test-results"
+            fi"""
         }.join('\n')
 
-        def reportWaitCommands = suiteList.collect { suite ->
-            "wait PID_HTML_${suite} PID_JSON_${suite} 2>/dev/null || true"
+        def suiteValidationChecks = suiteList.collect { suite ->
+            "if [ -f \"${suiteDir}/${suite}/results.json\" ]; then found=1; fi"
         }.join('\n            ')
 
         sh """
             set -e
 
-            echo "📁 Creating suite directory: ${suiteDir}"
+            echo "📁 Creating package directory: ${suiteDir}"
             mkdir -p "${suiteDir}"
 
-            ${reportCopyCommands}
+            ${suiteCopyCommands}
 
-            (cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true) &
-            PID3=\$!
-
-            (cp test_status*.json "${suiteDir}/" 2>/dev/null || true) &
-            PID4=\$!
-
-            if command -v realpath >/dev/null 2>&1; then
-                RESULTS_JSON_PATH="\$(realpath test-results/results.json 2>/dev/null || true)"
-            else
-                RESULTS_JSON_PATH="\$(pwd)/test-results/results.json"
-            fi
-            echo "results.json absolute path: \${RESULTS_JSON_PATH}"
-            if [ ! -f "test-results/results.json" ]; then
-                echo "ERROR: Playwright JSON reporter did not generate test-results/results.json"
+            found=0
+            ${suiteValidationChecks}
+            if [ "\$found" -eq 0 ]; then
+                echo "ERROR: No suite results.json found under reports/"
                 exit 1
             fi
-            cp test-results/results.json "${suiteDir}/results.json"
 
-            if [ -d "playwright-report" ]; then
-                cp -r playwright-report "${suiteDir}/playwright-report"
-            fi
-
-            if [ -d "test-results" ]; then
-                cp -r test-results "${suiteDir}/test-results"
-            fi
-
-            ${reportWaitCommands}
-            wait \$PID3 \$PID4 2>/dev/null || true
+            cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true
+            cp test_status*.json "${suiteDir}/" 2>/dev/null || true
 
             if command -v pigz >/dev/null 2>&1; then
                 echo "Using pigz for parallel compression..."
