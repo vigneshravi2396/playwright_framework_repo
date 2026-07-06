@@ -857,6 +857,10 @@
                 cp -r playwright-report "${suiteDir}/playwright-report"
             fi
 
+            if [ -d "test-results" ]; then
+                cp -r test-results "${suiteDir}/test-results"
+            fi
+
             ${reportWaitCommands}
             wait \$PID3 \$PID4 2>/dev/null || true
 
