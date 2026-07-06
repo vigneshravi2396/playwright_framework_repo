@@ -647,6 +647,48 @@
         echo '🧹 Cleared test-results/ and playwright-report/ for next suite'
     }
 
+    // Group flat Playwright suite entries by first folder in "file" (e.g. SauceThree/TC-015.spec.ts → SauceThree)
+    def transformPlaywrightResultsJson() {
+        sh '''
+            set -e
+            if [ ! -f "test-results/results.json" ]; then
+                echo "⚠️ No test-results/results.json to transform"
+                exit 0
+            fi
+            node -e "
+const fs = require('fs');
+const resultsPath = 'test-results/results.json';
+const report = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+const suites = Array.isArray(report.suites) ? report.suites : [];
+const groups = new Map();
+
+function groupKeyFromFile(file) {
+  if (!file) return 'unknown';
+  const slash = file.indexOf('/');
+  if (slash === -1) {
+    return file.replace(/\\.[^/.]+$/, '') || file;
+  }
+  return file.slice(0, slash);
+}
+
+for (const suite of suites) {
+  const key = groupKeyFromFile(suite.file || '');
+  if (!groups.has(key)) groups.set(key, []);
+  groups.get(key).push(Object.assign({}, suite, { title: suite.title || key }));
+}
+
+report.suites = Array.from(groups.entries()).map(([key, children]) => ({
+  title: key,
+  file: key,
+  suites: children,
+}));
+
+fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
+            "
+        '''
+        echo '✅ Transformed results.json suite hierarchy'
+    }
+
     // Preserve full suite report artifacts under reports/<suite>/ before the next suite runs
     def preserveSuiteReportArtifacts(String suite) {
         sh """
@@ -705,7 +747,8 @@
                 def testPaths = buildPlaywrightTestPaths(suite, testcases as List)
                 def exitCode = runPlaywrightTests(suite, testPaths, PASSWORD, BASE_URL, USER_NAME)
                 this.createTestStatus(suite, exitCode)
-                // Snapshot JSON, html report, and test artifacts for this suite
+                // Restructure suites[] by folder, then snapshot artifacts for this suite
+                transformPlaywrightResultsJson()
                 preserveSuiteReportArtifacts(suite)
                 if (exitCode != 0) {
                     overallExitCode = exitCode
