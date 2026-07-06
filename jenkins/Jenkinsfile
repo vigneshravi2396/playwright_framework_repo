@@ -14,7 +14,7 @@
             )
             string(
                 name: 'client_username',
-                defaultValue: '',
+                defaultValue: 'qadence-ideas2it',
                 description: 'Username for client repository checkout'
             )
             password(
