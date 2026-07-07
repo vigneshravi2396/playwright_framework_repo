@@ -22,11 +22,6 @@
                 defaultValue: '',
                 description: 'Personal Access Token for client repository checkout'
             )
-            // Multi-repo support: Repository 2 (leave empty to skip; Repository 1 uses the existing client_* params)
-            string(name: 'client_repo_url_2', defaultValue: '', description: 'Client repository 2 URL')
-            string(name: 'client_branch_2', defaultValue: '', description: 'Client repository 2 branch')
-            string(name: 'client_username_2', defaultValue: '', description: 'Client repository 2 username')
-            password(name: 'client_pat_2', defaultValue: '', description: 'Client repository 2 PAT')
             // New Requirement: suite_testcase JSON mapping suites to test files
             text(
                 name: 'suite_testcase',
@@ -131,34 +126,101 @@
                 }
             }
 
-            stage('Process Client Repositories') {
+            stage('Checkout') {
+                steps {
+                    script {
+                        try {
+                            echo '🔄 Checking out repository...'
+                            checkoutRepository()
+                            echo '✅ Checkout completed successfully'
+                        } catch (Exception e) {
+                            error("❌ Checkout failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            stage('Debug Workspace') {
+                steps {
+                    script {
+                        echo '🔍 Inspecting workspace structure...'
+                        sh '''
+                            pwd
+                            ls -la
+                            find . -maxdepth 3
+                        '''
+                        echo '⏳ Waiting 2 seconds...'
+                        sleep(time: 2, unit: 'SECONDS')
+                    }
+                }
+            }
+            
+            stage('Validate Suite') {
+                steps {
+                    script {
+                        def suiteTestcase = parseSuiteTestcase()
+                        validateSuiteTestcase(suiteTestcase)
+                    }
+                }
+            }
+
+            stage('Setup') {
+                environment {
+                    PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+                }
+                steps {
+                    script {
+                        try {
+                            echo '📦 Installing dependencies...'
+                            installDependenciesOptimized()
+
+                            echo '✅ Setup completed successfully'
+                        } catch (Exception e) {
+                            error("❌ Setup failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            stage('Create Metadata') {
+                steps {
+                    script {
+                        try {
+                            createMetadata()
+                        } catch (Exception e) {
+                            error("❌ Metadata creation failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+
+            stage('Execute Tests') {
                 options {
                     timeout(time: 100, unit: 'MINUTES')
                 }
                 steps {
                     script {
-                        // Build the ordered repo list (skips empty URLs, backward compatible)
-                        def repositories = buildClientRepositoryConfigs()
-                        if (repositories.isEmpty()) {
-                            error('No client repository configured (client_repo_url / client_repo_url_2 are both empty)')
+                        try {
+                            runSuiteTestcases()
+                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                            echo '⏱️ Test execution timed out'
+                            currentBuild.result = 'UNSTABLE'
+                        } catch (Exception e) {
+                            echo "⚠️ Test execution encountered errors: ${e.message}"
+                            currentBuild.result = 'UNSTABLE'
                         }
-                        def multiRepo = repositories.size() > 1
-                        echo "📚 ${repositories.size()} client repository(ies) queued for sequential execution"
+                    }
+                }
+            }
 
-                        // Each repository is processed completely and independently, one after another
-                        def failures = []
-                        for (def repo : repositories) {
-                            try {
-                                processClientRepository(repo, multiRepo)
-                            } catch (Exception e) {
-                                echo "❌ Repository [${repo.id}] failed: ${e.message}"
-                                failures << repo.id
-                            }
-                        }
-
-                        if (!failures.isEmpty()) {
+            stage('Upload to S3') {
+                steps {
+                    script {
+                        try {
+                            uploadToS3Optimized(env.ZIP_NAME)
+                        } catch (Exception e) {
                             currentBuild.result = 'FAILURE'
-                            error("Client repository execution failed for: ${failures.join(', ')}")
+                            error("S3 upload failed: ${e.message}")
                         }
                     }
                 }
@@ -225,78 +287,11 @@
     // OPTIMIZED UTILITY FUNCTIONS - ALL FIXED
     // ============================================================================
 
-    // Build the ordered list of client repositories to execute.
-    // Repo 1 falls back to legacy client_* params for backward compatibility; empty URLs are skipped.
-    def buildClientRepositoryConfigs() {
-        def repos = []
-
-        // Repository 1: existing client_* params (backward compatible)
-        def url1 = params.client_repo_url?.trim()
-        if (url1) {
-            repos << [
-                id      : 'repo1',
-                url     : url1,
-                branch  : params.client_branch?.trim(),
-                username: params.client_username?.trim(),
-                pat     : params.client_pat?.toString()?.trim()
-            ]
-        }
-
-        // Repository 2: only when explicitly provided
-        def url2 = params.client_repo_url_2?.trim()
-        if (url2) {
-            repos << [
-                id      : 'repo2',
-                url     : url2,
-                branch  : params.client_branch_2?.trim(),
-                username: params.client_username_2?.trim(),
-                pat     : params.client_pat_2?.toString()?.trim()
-            ]
-        }
-
-        return repos
-    }
-
-    // Run the complete, independent pipeline flow for a single client repository
-    def processClientRepository(Map repo, boolean multiRepo) {
-        echo "🚀 Processing client repository [${repo.id}]: ${repo.url}"
-
-        // 1. Clean workspace + checkout framework and this client repo
-        checkoutRepository(repo)
-
-        // 2. Validate the requested suites exist in this repo
-        validateSuiteTestcase(parseSuiteTestcase())
-
-        // 3. Install dependencies (hash cache skips reinstall when unchanged)
-        withEnv(['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']) {
-            installDependenciesOptimized()
-        }
-
-        // 4. Metadata for this run
-        createMetadata()
-
-        // 5. Execute + package (sets env.ZIP_NAME). Test failures => UNSTABLE but upload still runs
-        try {
-            runSuiteTestcases()
-        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
-            echo '⏱️ Test execution timed out'
-            currentBuild.result = 'UNSTABLE'
-        } catch (Exception e) {
-            echo "⚠️ Test execution encountered errors: ${e.message}"
-            currentBuild.result = 'UNSTABLE'
-        }
-
-        // 6. Upload this repo's ZIP separately (own S3 subfolder when running multiple repos)
-        uploadToS3Optimized(env.ZIP_NAME, multiRepo ? repo.id : null)
-
-        echo "✅ Completed client repository [${repo.id}]"
-    }
-
     // Two-repository checkout: framework repo + client tests repo
-    def checkoutRepository(Map repo = null) {
+    def checkoutRepository() {
         prepareWorkspaceForCheckout()
         checkoutFrameworkRepository()
-        checkoutClientTestsRepository(repo)
+        checkoutClientTestsRepository()
         materializeTestsFromClientRepository()
         validateTestsDirectory()
     }
@@ -353,22 +348,20 @@
         ]
     }
 
-    def checkoutClientTestsRepository(Map repo = null) {
-        // Backward compatible: fall back to legacy single-repo params when no repo map is supplied
-        def clientUrl = (repo?.url ?: params.client_repo_url)?.trim()
-        def clientUsername = (repo?.username ?: params.client_username)?.trim()
-        String gitPassword = (repo?.pat ?: params.client_pat?.toString())?.trim()
-        def clientBranch = (repo?.branch ?: params.client_branch)?.trim()
-
+    def checkoutClientTestsRepository() {
+        def clientUrl = params.client_repo_url?.trim()
         if (!clientUrl) {
             error('client_repo_url is mandatory')
         }
-        if (!clientUsername) {
+        if (!params.client_username?.trim()) {
             error('client_username is mandatory')
         }
+        String gitPassword = params.client_pat.toString().trim()
         if (!gitPassword) {
             error('client_pat is mandatory')
         }
+
+        def clientBranch = params.client_branch?.trim()
         if (!clientBranch) {
             error('client_branch is mandatory')
         }
@@ -381,7 +374,7 @@
         def safeHostPath = repoHostPath.replace("'", "'\\''")
         def authUser = repoHostPath.toLowerCase().startsWith('github.com/')
             ? 'x-access-token'
-            : clientUsername.replace("'", "'\\''")
+            : params.client_username.trim().replace("'", "'\\''")
 
         withEnv(["CLIENT_GIT_PASSWORD=${gitPassword}"]) {
             sh(label: 'Clone client repository', script: """
@@ -953,7 +946,7 @@ fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
         """
     }
 
-    def uploadToS3Optimized(String zipFile, String repoSubPath = null) {
+    def uploadToS3Optimized(String zipFile) {
         if (!zipFile || zipFile == 'N/A') {
             echo '❌ No zip file specified for upload'
             error('No zip file specified for upload')
@@ -969,11 +962,6 @@ fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
         def prefix = (params.s3_prefix ?: '')
             .replaceAll('^/+', '')
             .replaceAll('/+$', '')
-
-        // Keep each repository's uploads in a separate S3 subfolder when running multiple repos
-        if (repoSubPath) {
-            prefix = prefix ? "${prefix}/${repoSubPath}" : repoSubPath
-        }
 
         def s3Path = prefix ?
             "s3://taas-qa-ai/${prefix}/${zipFile}" :
