@@ -22,12 +22,7 @@
                 defaultValue: '',
                 description: 'Personal Access Token for client repository checkout'
             )
-            // Multi-repo support: Repository 1 (leave empty to fall back to legacy client_* params)
-            string(name: 'client_repo_url_1', defaultValue: '', description: 'Client repository 1 URL')
-            string(name: 'client_branch_1', defaultValue: '', description: 'Client repository 1 branch')
-            string(name: 'client_username_1', defaultValue: '', description: 'Client repository 1 username')
-            password(name: 'client_pat_1', defaultValue: '', description: 'Client repository 1 PAT')
-            // Multi-repo support: Repository 2 (leave empty to skip)
+            // Multi-repo support: Repository 2 (leave empty to skip; Repository 1 uses the existing client_* params)
             string(name: 'client_repo_url_2', defaultValue: '', description: 'Client repository 2 URL')
             string(name: 'client_branch_2', defaultValue: '', description: 'Client repository 2 branch')
             string(name: 'client_username_2', defaultValue: '', description: 'Client repository 2 username')
@@ -145,7 +140,7 @@
                         // Build the ordered repo list (skips empty URLs, backward compatible)
                         def repositories = buildClientRepositoryConfigs()
                         if (repositories.isEmpty()) {
-                            error('No client repository configured (client_repo_url_1 / client_repo_url_2 are both empty)')
+                            error('No client repository configured (client_repo_url / client_repo_url_2 are both empty)')
                         }
                         def multiRepo = repositories.size() > 1
                         echo "📚 ${repositories.size()} client repository(ies) queued for sequential execution"
@@ -235,17 +230,19 @@
     def buildClientRepositoryConfigs() {
         def repos = []
 
-        def url1 = params.client_repo_url_1?.trim() ?: params.client_repo_url?.trim()
+        // Repository 1: existing client_* params (backward compatible)
+        def url1 = params.client_repo_url?.trim()
         if (url1) {
             repos << [
                 id      : 'repo1',
                 url     : url1,
-                branch  : params.client_branch_1?.trim() ?: params.client_branch?.trim(),
-                username: params.client_username_1?.trim() ?: params.client_username?.trim(),
-                pat     : params.client_pat_1?.toString()?.trim() ?: params.client_pat?.toString()?.trim()
+                branch  : params.client_branch?.trim(),
+                username: params.client_username?.trim(),
+                pat     : params.client_pat?.toString()?.trim()
             ]
         }
 
+        // Repository 2: only when explicitly provided
         def url2 = params.client_repo_url_2?.trim()
         if (url2) {
             repos << [
