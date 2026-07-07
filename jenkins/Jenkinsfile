@@ -22,6 +22,11 @@
                 defaultValue: '',
                 description: 'Personal Access Token for client repository checkout'
             )
+            // Optional second client repository (leave URL empty to skip; Repository 1 uses the params above)
+            string(name: 'client_repo_url_2', defaultValue: '', description: 'Client repository 2 URL (optional)')
+            string(name: 'client_branch_2', defaultValue: '', description: 'Client repository 2 branch')
+            string(name: 'client_username_2', defaultValue: '', description: 'Client repository 2 username')
+            password(name: 'client_pat_2', defaultValue: '', description: 'Client repository 2 PAT')
             // New Requirement: suite_testcase JSON mapping suites to test files
             text(
                 name: 'suite_testcase',
@@ -243,6 +248,60 @@
                     }
                 }
             }
+
+            // New: when BOTH repositories are provided, re-run the complete existing flow for Repository 2
+            stage('Process Repository 2') {
+                when {
+                    expression { params.client_repo_url?.trim() && params.client_repo_url_2?.trim() }
+                }
+                options {
+                    timeout(time: 100, unit: 'MINUTES')
+                }
+                steps {
+                    script {
+                        def repo2 = clientRepositoryConfig('repo2')
+                        echo "🚀 Processing Repository 2: ${repo2.url}"
+
+                        // Reuse the exact same steps/functions as the primary flow above
+                        cleanWorkspace()
+                        checkoutRepository(repo2)
+                        validateSuiteTestcase(parseSuiteTestcase())
+                        withEnv(['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']) {
+                            installDependenciesOptimized()
+                        }
+                        createMetadata()
+
+                        try {
+                            runSuiteTestcases()
+                        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                            echo '⏱️ Test execution timed out'
+                            currentBuild.result = 'UNSTABLE'
+                        } catch (Exception e) {
+                            echo "⚠️ Test execution encountered errors: ${e.message}"
+                            currentBuild.result = 'UNSTABLE'
+                        }
+
+                        try {
+                            uploadToS3Optimized(env.ZIP_NAME)
+                        } catch (Exception e) {
+                            currentBuild.result = 'FAILURE'
+                            error("S3 upload failed: ${e.message}")
+                        }
+
+                        try {
+                            echo '📦 Archiving artifacts...'
+                            archiveArtifacts(
+                                artifacts: '**/*.zip,metadata.json,test_status*.json,test_summary.json',
+                                allowEmptyArchive: true,
+                                fingerprint: true,
+                                onlyIfSuccessful: false
+                            )
+                        } catch (Exception e) {
+                            echo "⚠️ Artifact archiving failed: ${e.message}"
+                        }
+                    }
+                }
+            }
                 }
             }
         }
@@ -287,11 +346,46 @@
     // OPTIMIZED UTILITY FUNCTIONS - ALL FIXED
     // ============================================================================
 
-    // Two-repository checkout: framework repo + client tests repo
-    def checkoutRepository() {
+    // Return the config map for a given repository id ('repo1' | 'repo2'), or null when its URL is empty
+    def clientRepositoryConfig(String id) {
+        if (id == 'repo1') {
+            def url = params.client_repo_url?.trim()
+            if (!url) return null
+            return [
+                id      : 'repo1',
+                url     : url,
+                branch  : params.client_branch?.trim(),
+                username: params.client_username?.trim(),
+                pat     : params.client_pat?.toString()?.trim()
+            ]
+        }
+        def url2 = params.client_repo_url_2?.trim()
+        if (!url2) return null
+        return [
+            id      : 'repo2',
+            url     : url2,
+            branch  : params.client_branch_2?.trim(),
+            username: params.client_username_2?.trim(),
+            pat     : params.client_pat_2?.toString()?.trim()
+        ]
+    }
+
+    // Primary repository the existing flow runs on: Repository 1 if provided, otherwise Repository 2.
+    def primaryClientRepository() {
+        def repo = clientRepositoryConfig('repo1') ?: clientRepositoryConfig('repo2')
+        if (!repo) {
+            error('At least one client repository must be provided.')
+        }
+        return repo
+    }
+
+    // Two-repository checkout: framework repo + client tests repo.
+    // repo == null → use the primary repository (backward compatible with the existing single-repo flow).
+    def checkoutRepository(Map repo = null) {
+        def targetRepo = repo ?: primaryClientRepository()
         prepareWorkspaceForCheckout()
         checkoutFrameworkRepository()
-        checkoutClientTestsRepository()
+        checkoutClientTestsRepository(targetRepo)
         materializeTestsFromClientRepository()
         validateTestsDirectory()
     }
@@ -348,22 +442,24 @@
         ]
     }
 
-    def checkoutClientTestsRepository() {
-        def clientUrl = params.client_repo_url?.trim()
-        if (!clientUrl) {
-            error('client_repo_url is mandatory')
-        }
-        if (!params.client_username?.trim()) {
-            error('client_username is mandatory')
-        }
-        String gitPassword = params.client_pat.toString().trim()
-        if (!gitPassword) {
-            error('client_pat is mandatory')
-        }
+    def checkoutClientTestsRepository(Map repo = null) {
+        // Backward compatible: fall back to legacy single-repo params when no repo map is supplied
+        def clientUrl = (repo?.url ?: params.client_repo_url)?.trim()
+        def clientUsername = (repo?.username ?: params.client_username)?.trim()
+        String gitPassword = (repo?.pat ?: params.client_pat?.toString())?.trim()
+        def clientBranch = (repo?.branch ?: params.client_branch)?.trim()
 
-        def clientBranch = params.client_branch?.trim()
+        if (!clientUrl) {
+            error('client repository URL is mandatory')
+        }
+        if (!clientUsername) {
+            error('client username is mandatory')
+        }
+        if (!gitPassword) {
+            error('client PAT is mandatory')
+        }
         if (!clientBranch) {
-            error('client_branch is mandatory')
+            error('client branch is mandatory')
         }
         def clientTestsDir = 'client-tests'
 
@@ -374,7 +470,7 @@
         def safeHostPath = repoHostPath.replace("'", "'\\''")
         def authUser = repoHostPath.toLowerCase().startsWith('github.com/')
             ? 'x-access-token'
-            : params.client_username.trim().replace("'", "'\\''")
+            : clientUsername.replace("'", "'\\''")
 
         withEnv(["CLIENT_GIT_PASSWORD=${gitPassword}"]) {
             sh(label: 'Clone client repository', script: """
