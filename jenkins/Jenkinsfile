@@ -17,10 +17,20 @@
                 defaultValue: 'qadence-ideas2it',
                 description: 'Username for client repository checkout'
             )
-            password(
-                name: 'client_pat',
+            string(
+                name: 'encrypted_github_pat',
                 defaultValue: '',
-                description: 'Personal Access Token for client repository checkout'
+                description: 'AES-256-CBC encrypted GitHub PAT for client repository checkout'
+            )
+            string(
+                name: 'encrypted_aws_access_key',
+                defaultValue: '',
+                description: 'AES-256-CBC encrypted AWS access key ID for S3 upload'
+            )
+            string(
+                name: 'encrypted_aws_secret_key',
+                defaultValue: '',
+                description: 'AES-256-CBC encrypted AWS secret access key for S3 upload'
             )
             // New Requirement: suite_testcase JSON mapping suites to test files
             text(
@@ -42,16 +52,6 @@
                 name: 's3_prefix',
                 defaultValue: '/testing/results/upload/2026-06-17_07-43-21/staging',
                 description: 'Folder path inside the S3 bucket'
-            )
-            password(
-                name: 'aws_access_key_id',
-                defaultValue: '',
-                description: 'AWS access key ID for S3 upload'
-            )
-            password(
-                name: 'aws_secret_access_key',
-                defaultValue: '',
-                description: 'AWS secret access key for S3 upload'
             )
             string(
                 name: 'aws_region',
@@ -296,6 +296,45 @@
         validateTestsDirectory()
     }
 
+    // Decrypt a single AES-256-CBC (pbkdf2) Base64 value using the Jenkins-held encryption key.
+    // Key comes only from the 'aws-encryption-key' Secret Text credential, never a parameter.
+    // Writes ciphertext to a temp file, decrypts, returns plaintext, and always removes temp files.
+    def decryptValue(String encryptedValue) {
+        if (!encryptedValue?.trim()) {
+            error('❌ Encrypted value is empty')
+        }
+
+        def encFile = ".dec-in-${UUID.randomUUID().toString()}"
+        def outFile = ".dec-out-${UUID.randomUUID().toString()}"
+        writeFile(file: encFile, text: encryptedValue.trim())
+
+        withCredentials([string(credentialsId: 'aws-encryption-key', variable: 'ENCRYPTION_KEY')]) {
+            try {
+                def status = withEnv(["DEC_IN=${encFile}", "DEC_OUT=${outFile}"]) {
+                    sh(
+                        label: 'Decrypt value',
+                        returnStatus: true,
+                        script: '''
+                            set +x
+                            openssl enc -d -aes-256-cbc -pbkdf2 -base64 -A -in "$DEC_IN" -out "$DEC_OUT" -pass env:ENCRYPTION_KEY
+                        '''
+                    )
+                }
+                if (status != 0) {
+                    error("❌ OpenSSL decryption failed (invalid key or corrupt data) [code: ${status}]")
+                }
+
+                def plaintext = readFile(outFile).trim()
+                if (!plaintext) {
+                    error('❌ Decrypted value is empty')
+                }
+                return plaintext
+            } finally {
+                sh(label: 'Cleanup temp files', script: "rm -f '${encFile}' '${outFile}'")
+            }
+        }
+    }
+
     def prepareWorkspaceForCheckout() {
         sh '''
             set +e
@@ -356,9 +395,9 @@
         if (!params.client_username?.trim()) {
             error('client_username is mandatory')
         }
-        String gitPassword = params.client_pat.toString().trim()
+        String gitPassword = decryptValue(params.encrypted_github_pat)
         if (!gitPassword) {
-            error('client_pat is mandatory')
+            error('encrypted_github_pat is mandatory')
         }
 
         def clientBranch = params.client_branch?.trim()
@@ -967,18 +1006,18 @@ fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
             "s3://taas-qa-ai/${prefix}/${zipFile}" :
             "s3://taas-qa-ai/${zipFile}"
 
-        String awsAccessKeyId = params.aws_access_key_id.toString().trim()
-        String awsSecretAccessKey = params.aws_secret_access_key.toString().trim()
+        String awsAccessKeyId = decryptValue(params.encrypted_aws_access_key)
+        String awsSecretAccessKey = decryptValue(params.encrypted_aws_secret_key)
         String awsRegion = params.aws_region?.trim()
         if (!awsRegion) {
             awsRegion = 'us-east-1'
         }
 
         if (!awsAccessKeyId) {
-            error('aws_access_key_id is mandatory')
+            error('encrypted_aws_access_key is mandatory')
         }
         if (!awsSecretAccessKey) {
-            error('aws_secret_access_key is mandatory')
+            error('encrypted_aws_secret_key is mandatory')
         }
 
         def credsFile = '.jenkins-aws-credentials'
