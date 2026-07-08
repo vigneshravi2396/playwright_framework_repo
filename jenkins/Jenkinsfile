@@ -395,9 +395,9 @@
         if (!params.client_username?.trim()) {
             error('client_username is mandatory')
         }
-        String gitPassword = decryptValue(params.encrypted_github_pat)
+        String gitPassword = decryptValue(params.client_pat)
         if (!gitPassword) {
-            error('encrypted_github_pat is mandatory')
+            error('client_pat is mandatory')
         }
 
         def clientBranch = params.client_branch?.trim()
@@ -1006,18 +1006,18 @@ fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
             "s3://taas-qa-ai/${prefix}/${zipFile}" :
             "s3://taas-qa-ai/${zipFile}"
 
-        String awsAccessKeyId = decryptValue(params.encrypted_aws_access_key)
-        String awsSecretAccessKey = decryptValue(params.encrypted_aws_secret_key)
+        String awsAccessKeyId = decryptValue(params.aws_access_key_id)
+        String awsSecretAccessKey = decryptValue(params.aws_secret_access_key)
         String awsRegion = params.aws_region?.trim()
         if (!awsRegion) {
             awsRegion = 'us-east-1'
         }
 
         if (!awsAccessKeyId) {
-            error('encrypted_aws_access_key is mandatory')
+            error('aws_access_key_id is mandatory')
         }
         if (!awsSecretAccessKey) {
-            error('encrypted_aws_secret_key is mandatory')
+            error('aws_secret_access_key is mandatory')
         }
 
         def credsFile = '.jenkins-aws-credentials'
