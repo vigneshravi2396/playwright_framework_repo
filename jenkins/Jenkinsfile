@@ -92,6 +92,8 @@
                 steps {
                     script {
                         try {
+                            echo '🔄 Checking out repository (required for Docker build context)...'
+                            checkoutRepository()
                             ensureDockerAgentImage()
                         } catch (Exception e) {
                             error("❌ Docker image preparation failed: ${e.message}")
@@ -119,28 +121,6 @@
                             echo '✅ Workspace prepared'
                         } catch (Exception e) {
                             error("❌ Workspace preparation failed: ${e.message}")
-                        }
-                    }
-                }
-            }
-
-            stage('Decrypt Secrets') {
-                steps {
-                    script {
-                        try {
-                            echo '🔐 Decrypting secrets...'
-                            withCredentials([string(credentialsId: 'MASTER_KEY', variable: 'MASTER_KEY')]) {
-                                env.CLIENT_PAT = decryptAES(params.client_pat.toString().trim(), MASTER_KEY)
-                                echo 'Client PAT decrypted successfully'
-
-                                env.AWS_ACCESS_KEY = decryptAES(params.aws_access_key_id.toString().trim(), MASTER_KEY)
-                                echo 'AWS Access Key decrypted successfully'
-
-                                env.AWS_SECRET_KEY = decryptAES(params.aws_secret_access_key.toString().trim(), MASTER_KEY)
-                                echo 'AWS Secret Key decrypted successfully'
-                            }
-                        } catch (Exception e) {
-                            error("❌ Secret decryption failed: ${e.message}")
                         }
                     }
                 }
@@ -307,44 +287,6 @@
     // OPTIMIZED UTILITY FUNCTIONS - ALL FIXED
     // ============================================================================
 
-    // Decrypt AES (AES-256-CBC) Base64 payload of form Base64([16-byte IV][ciphertext]).
-    // Key is derived as SHA-256(masterKey). Returns original plaintext.
-    @NonCPS
-    String decryptAES(String encryptedValue, String masterKey) {
-        if (!encryptedValue?.trim()) {
-            throw new IllegalArgumentException('encrypted value is empty')
-        }
-        if (!masterKey?.trim()) {
-            throw new IllegalArgumentException('master key is empty')
-        }
-
-        byte[] combined = java.util.Base64.getDecoder().decode(encryptedValue.trim())
-        if (combined.length <= 16) {
-            throw new IllegalArgumentException('invalid encrypted payload')
-        }
-
-        byte[] iv = new byte[16]
-        byte[] cipherBytes = new byte[combined.length - 16]
-        for (int i = 0; i < 16; i++) {
-            iv[i] = combined[i]
-        }
-        for (int i = 16; i < combined.length; i++) {
-            cipherBytes[i - 16] = combined[i]
-        }
-
-        byte[] keyBytes = java.security.MessageDigest.getInstance('SHA-256')
-            .digest(masterKey.trim().getBytes('UTF-8'))
-
-        javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance('AES/CBC/PKCS5Padding')
-        cipher.init(
-            javax.crypto.Cipher.DECRYPT_MODE,
-            new javax.crypto.spec.SecretKeySpec(keyBytes, 'AES'),
-            new javax.crypto.spec.IvParameterSpec(iv)
-        )
-
-        return new String(cipher.doFinal(cipherBytes), 'UTF-8')
-    }
-
     // Two-repository checkout: framework repo + client tests repo
     def checkoutRepository() {
         prepareWorkspaceForCheckout()
@@ -414,7 +356,7 @@
         if (!params.client_username?.trim()) {
             error('client_username is mandatory')
         }
-        String gitPassword = env.CLIENT_PAT?.toString()?.trim()
+        String gitPassword = params.client_pat.toString().trim()
         if (!gitPassword) {
             error('client_pat is mandatory')
         }
@@ -1025,8 +967,8 @@ fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
             "s3://taas-qa-ai/${prefix}/${zipFile}" :
             "s3://taas-qa-ai/${zipFile}"
 
-        String awsAccessKeyId = env.AWS_ACCESS_KEY?.toString()?.trim()
-        String awsSecretAccessKey = env.AWS_SECRET_KEY?.toString()?.trim()
+        String awsAccessKeyId = params.aws_access_key_id.toString().trim()
+        String awsSecretAccessKey = params.aws_secret_access_key.toString().trim()
         String awsRegion = params.aws_region?.trim()
         if (!awsRegion) {
             awsRegion = 'us-east-1'

@@ -9,7 +9,8 @@ RUN apt-get update && \
         zip \
         unzip \
         curl \
-        gnupg && \
+        gnupg \
+        openjdk-17-jre-headless && \
     \
     # Install Google Chrome
     curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google.gpg && \
