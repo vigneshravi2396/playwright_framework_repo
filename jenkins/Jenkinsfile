@@ -18,17 +18,17 @@
                 description: 'Username for client repository checkout'
             )
             string(
-                name: 'encrypted_github_pat',
+                name: 'client_pat',
                 defaultValue: '',
                 description: 'AES-256-CBC encrypted GitHub PAT for client repository checkout'
             )
             string(
-                name: 'encrypted_aws_access_key',
+                name: 'aws_access_key_id',
                 defaultValue: '',
                 description: 'AES-256-CBC encrypted AWS access key ID for S3 upload'
             )
             string(
-                name: 'encrypted_aws_secret_key',
+                name: 'aws_secret_access_key',
                 defaultValue: '',
                 description: 'AES-256-CBC encrypted AWS secret access key for S3 upload'
             )
