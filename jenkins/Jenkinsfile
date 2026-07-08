@@ -323,8 +323,14 @@
             throw new IllegalArgumentException('invalid encrypted payload')
         }
 
-        byte[] iv = java.util.Arrays.copyOfRange(combined, 0, 16)
-        byte[] cipherBytes = java.util.Arrays.copyOfRange(combined, 16, combined.length)
+        byte[] iv = new byte[16]
+        byte[] cipherBytes = new byte[combined.length - 16]
+        for (int i = 0; i < 16; i++) {
+            iv[i] = combined[i]
+        }
+        for (int i = 16; i < combined.length; i++) {
+            cipherBytes[i - 16] = combined[i]
+        }
 
         byte[] keyBytes = java.security.MessageDigest.getInstance('SHA-256')
             .digest(masterKey.trim().getBytes('UTF-8'))
