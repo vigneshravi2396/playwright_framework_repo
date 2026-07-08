@@ -316,7 +316,7 @@
                         returnStatus: true,
                         script: '''
                             set +x
-                            openssl enc -d -aes-256-cbc -pbkdf2 -base64 -A -in "$DEC_IN" -out "$DEC_OUT" -pass env:ENCRYPTION_KEY
+                            openssl enc -d -aes-256-cbc -pbkdf2 -a -A -in "$DEC_IN" -out "$DEC_OUT" -pass env:ENCRYPTION_KEY
                         '''
                     )
                 }
