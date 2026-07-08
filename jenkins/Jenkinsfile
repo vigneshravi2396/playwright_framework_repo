@@ -92,8 +92,6 @@
                 steps {
                     script {
                         try {
-                            echo '🔄 Checking out repository (required for Docker build context)...'
-                            checkoutRepository()
                             ensureDockerAgentImage()
                         } catch (Exception e) {
                             error("❌ Docker image preparation failed: ${e.message}")
