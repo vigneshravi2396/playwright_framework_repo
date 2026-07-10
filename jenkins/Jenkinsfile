@@ -159,6 +159,7 @@
                 steps {
                     script {
                         def suiteTestcase = parseSuiteTestcase()
+                        cacheSuitePathMap(discoverSuitePaths())
                         validateSuiteTestcase(suiteTestcase)
                     }
                 }
@@ -488,16 +489,90 @@
         return parsed
     }
 
+    // Recursively scan tests/ once and map suite folder name → actual directory path
+    def discoverSuitePaths() {
+        echo '🔍 Discovering suite directories under tests/...'
+        def output = sh(
+            script: '''
+                set -e
+                find tests -type d ! -path tests ! -path '*/.*' 2>/dev/null | while IFS= read -r dir; do
+                    name=$(basename "$dir")
+                    printf '%s|%s\n' "$name" "$dir"
+                done
+            ''',
+            returnStdout: true
+        ).trim()
+
+        def map = [:]
+        if (output) {
+            output.split('\n').each { line ->
+                if (!line?.trim()) {
+                    return
+                }
+                def separator = line.indexOf('|')
+                if (separator < 0) {
+                    return
+                }
+                def name = line.substring(0, separator)
+                def path = line.substring(separator + 1)
+                if (map.containsKey(name)) {
+                    def existing = map[name]
+                    if (existing instanceof List) {
+                        existing.add(path)
+                    } else {
+                        map[name] = [existing, path]
+                    }
+                } else {
+                    map[name] = path
+                }
+            }
+        }
+
+        echo "✅ Discovered ${map.size()} suite name(s): ${map.keySet().join(', ')}"
+        map.each { name, path ->
+            def display = path instanceof List ? path.join(', ') : path
+            echo "   ${name} → ${display}"
+        }
+        return map
+    }
+
+    def cacheSuitePathMap(Map suitePathMap) {
+        env.SUITE_PATH_MAP = groovy.json.JsonOutput.toJson(suitePathMap)
+    }
+
+    def getSuitePathMap() {
+        if (!env.SUITE_PATH_MAP?.trim()) {
+            error('Suite path map not initialized — discovery must run before suite validation or execution')
+        }
+        return readJSON(text: env.SUITE_PATH_MAP)
+    }
+
+    def resolveSuitePath(String suite) {
+        def map = getSuitePathMap()
+        if (!map.containsKey(suite)) {
+            error("Suite '${suite}' not found under tests/ (searched recursively)")
+        }
+        def path = map[suite]
+        if (path instanceof Collection) {
+            if (path.size() > 1) {
+                error("Ambiguous suite '${suite}': found at ${path.join(', ')}")
+            }
+            return path[0] as String
+        }
+        return path as String
+    }
+
     // New Requirement: validate all suite folders and testcase files from JSON
     def validateSuiteTestcase(Map suiteTestcase) {
         suiteTestcase.each { suite, testcases ->
             echo "Validating suite: ${suite}"
+            def suiteDir = resolveSuitePath(suite)
             def suiteExists = sh(
-                script: "test -d tests/${suite}",
+                script: "test -d '${suiteDir}'",
                 returnStatus: true
             ) == 0
             if (!suiteExists) {
-                error("Suite '${suite}' not found at tests/${suite}")
+                error("Suite '${suite}' not found at ${suiteDir}")
             }
             if (!(testcases instanceof List) || testcases.isEmpty()) {
                 error("Suite '${suite}' must have at least one testcase")
@@ -506,25 +581,26 @@
                 if (testcase == 'all') {
                     return
                 }
-                def specPath = "tests/${suite}/${testcase}"
+                def specPath = "${suiteDir}/${testcase}"
                 def testcaseExists = sh(
-                    script: "test -f ${specPath}",
+                    script: "test -f '${specPath}'",
                     returnStatus: true
                 ) == 0
                 if (!testcaseExists) {
                     error("Testcase '${testcase}' not found at ${specPath}")
                 }
             }
-            echo "Suite '${suite}' validated"
+            echo "Suite '${suite}' validated at ${suiteDir}"
         }
     }
 
     // New Requirement: build Playwright test paths from suite and testcase list
     def buildPlaywrightTestPaths(String suite, List testcases) {
+        def suiteDir = resolveSuitePath(suite)
         if (testcases.contains('all')) {
-            return ["tests/${suite}"]
+            return [suiteDir]
         }
-        return testcases.collect { "tests/${suite}/${it}" }
+        return testcases.collect { "${suiteDir}/${it}" }
     }
 
     def ensureDockerAgentImage() {
