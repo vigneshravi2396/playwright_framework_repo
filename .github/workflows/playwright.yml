@@ -113,7 +113,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
       SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
       ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
-      ENCRYPTION_KEY: ${{ secrets.aws_access_key_id || secrets.aws_secret_access_key }}
+      ENCRYPTION_KEY: ${{ secrets.AWS_ENCRYPTION_KEY || secrets.ENCRYPTION_KEY }}
 
     steps:
       # 1–2. Checkout Framework, then Prepare Workspace (GHA needs checkout before clean)
@@ -177,8 +177,8 @@ jobs:
             echo "::error::client_pat is mandatory"
             exit 1
           fi
-          if [ -z "${aws_access_key_id// }" ] || [ -z "${aws_secret_access_key// }" ]; then
-            echo "::error::Missing aws_access_key_id / aws_secret_access_key secret"
+          if [ -z "${ENCRYPTION_KEY// }" ]; then
+            echo "::error::Missing AWS_ENCRYPTION_KEY / ENCRYPTION_KEY secret"
             exit 1
           fi
 
