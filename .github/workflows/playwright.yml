@@ -813,20 +813,9 @@ jobs:
               if name.startswith("test_status") and name.endswith(".json"):
                   shutil.copy2(name, suite_dir)
 
-          if shutil.which("pigz"):
-              print("Using pigz for parallel compression...")
-              # Jenkins: tar | pigz > zipName
-              with open(zip_name, "wb") as out:
-                  tar = subprocess.Popen(["tar", "-cf", "-", suite_dir], stdout=subprocess.PIPE)
-                  pigz = subprocess.Popen(["pigz", "-6"], stdin=tar.stdout, stdout=out)
-                  tar.stdout.close()
-                  pigz.communicate()
-                  if pigz.returncode != 0:
-                      raise SystemExit(f"Failed to create archive: {zip_name}")
-          else:
-              rc = subprocess.call(["zip", "-r", "-q", "-6", zip_name, suite_dir])
-              if rc != 0:
-                  raise SystemExit(f"Failed to create zip: {zip_name}")
+          rc = subprocess.call(["zip", "-r", "-q", "-6", zip_name, suite_dir])
+          if rc != 0:
+              raise SystemExit(f"Failed to create zip: {zip_name}")
 
           if not os.path.isfile(zip_name):
               raise SystemExit(f"❌ Failed to create zip: {zip_name}")

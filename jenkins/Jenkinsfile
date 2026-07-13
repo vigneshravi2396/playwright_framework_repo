@@ -1035,12 +1035,7 @@ fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
             cp "${env.METADATA_FILE}" "${suiteDir}/" 2>/dev/null || true
             cp test_status*.json "${suiteDir}/" 2>/dev/null || true
 
-            if command -v pigz >/dev/null 2>&1; then
-                echo "Using pigz for parallel compression..."
-                tar -cf - "${suiteDir}" | pigz -6 > "${zipName}"
-            else
-                zip -r -q -6 "${zipName}" "${suiteDir}"
-            fi
+            zip -r -q -6 "${zipName}" "${suiteDir}"
 
             echo "🔍 Verifying zip file creation..."
             if [ ! -f "${zipName}" ]; then
