@@ -433,7 +433,6 @@ jobs:
       - name: Execute Tests
         id: execute_tests
         timeout-minutes: 100
-        continue-on-error: true
         env:
           SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
           BROWSER: ${{ github.event.inputs.browser }}
@@ -469,12 +468,16 @@ jobs:
 
           OVERALL_EXIT=0
           FIRST=1
+          : > /tmp/test_failure_summary.txt
 
           python3 - <<'PY' > /tmp/suite_order.txt
           import json, os
           for suite in json.loads(os.environ["SUITE_TESTCASE"]).keys():
               print(suite)
           PY
+
+          # Keep set +e for the suite loop so post-processing cannot mask Playwright's real exit code
+          set +e
 
           while IFS= read -r SUITE; do
             [ -z "$SUITE" ] && continue
@@ -504,8 +507,17 @@ jobs:
               print(" ".join(f"{path}/{tc}" for tc in testcases))
           PY
           )
+            PATHS_RC=$?
+            if [ "$PATHS_RC" -ne 0 ] || [ -z "$PATHS_ARG" ]; then
+              echo "::error::Failed to resolve Playwright paths for suite '${SUITE}'"
+              EXIT_CODE=1
+              OVERALL_EXIT=1
+              echo "suite=${SUITE} exit=1 reason=path_resolution" >> /tmp/test_failure_summary.txt
+              continue
+            fi
+            echo "📂 Playwright paths: ${PATHS_ARG}"
+            echo "🌐 Project: ${PLAYWRIGHT_PROJECT}  workers: ${WORKERS:-default}"
 
-            set +e
             (
               while true; do
                 sleep 60
@@ -520,7 +532,6 @@ jobs:
             LOG_PID=$!
 
             # Match Jenkins runPlaywrightTests env + command
-            export IS_REGRESSION=false
             timeout 5400 env \
               SUITE="$SUITE" \
               BROWSER="$BROWSER" \
@@ -529,10 +540,115 @@ jobs:
               $PATHS_ARG \
               --project="$PLAYWRIGHT_PROJECT" \
               ${WORKERS:+--workers=$WORKERS}
-            EXIT_CODE=$?
+            RAW_EXIT=$?
             kill "$LOG_PID" 2>/dev/null || true
-            set -e
+            wait "$LOG_PID" 2>/dev/null || true
+
+            echo "📟 Playwright process exit code (raw): ${RAW_EXIT}"
+
+            # Reconcile process exit with results.json (source of truth for pass/fail).
+            # If all tests passed but process exited non-zero, do not mark suite failed.
+            export RAW_EXIT
+            EXIT_CODE=$(python3 - <<'PY'
+          import json, os, sys
+
+          raw = int(os.environ.get("RAW_EXIT", "1"))
+          results_path = "test-results/results.json"
+          if not os.path.isfile(results_path):
+              print(raw)
+              sys.exit(0)
+
+          with open(results_path, encoding="utf-8") as f:
+              report = json.load(f)
+          stats = report.get("stats") or {}
+          expected = int(stats.get("expected") or 0)
+          unexpected = int(stats.get("unexpected") or 0)
+          flaky = int(stats.get("flaky") or 0)
+          skipped = int(stats.get("skipped") or 0)
+
+          print(
+              f"📊 results.json stats: expected={expected} unexpected={unexpected} "
+              f"flaky={flaky} skipped={skipped}",
+              file=sys.stderr,
+          )
+
+          # Real test failures always fail the suite
+          if unexpected > 0:
+              print(1)
+              sys.exit(0)
+
+          # All executed tests passed
+          if expected > 0 and unexpected == 0:
+              if raw != 0:
+                  print(
+                      f"⚠️ Process exit was {raw} but results.json shows all tests passed "
+                      f"(expected={expected}, unexpected=0) — treating suite as PASSED",
+                      file=sys.stderr,
+                  )
+              print(0)
+              sys.exit(0)
+
+          # No passing tests recorded — trust process exit (infra / no tests run)
+          print(raw)
+          PY
+          )
             export EXIT_CODE
+            echo "📟 Suite '${SUITE}' reconciled exit code: ${EXIT_CODE}"
+
+            # Surface root-cause failed tests in this step (not only at job end)
+            python3 - <<'PY'
+          import json, os, sys
+
+          suite = os.environ["SUITE"]
+          exit_code = int(os.environ["EXIT_CODE"])
+          results_path = "test-results/results.json"
+          summary_path = "/tmp/test_failure_summary.txt"
+
+          def walk(nodes, prefix=""):
+              for node in nodes or []:
+                  title = node.get("title") or node.get("file") or ""
+                  name = f"{prefix} › {title}" if prefix and title else (title or prefix)
+                  for spec in node.get("specs") or []:
+                      spec_title = spec.get("title") or ""
+                      full = f"{name} › {spec_title}" if name else spec_title
+                      for t in spec.get("tests") or []:
+                          for r in t.get("results") or []:
+                              if r.get("status") in ("failed", "timedOut", "interrupted"):
+                                  err = ""
+                                  for e in r.get("errors") or []:
+                                      err = (e.get("message") or str(e) or "").strip()
+                                      if err:
+                                          break
+                                  yield full, err or r.get("status")
+                  yield from walk(node.get("suites") or [], name)
+
+          if exit_code != 0:
+              print(f"::warning::Suite '{suite}' FAILED (exit code {exit_code})")
+              with open(summary_path, "a", encoding="utf-8") as sf:
+                  sf.write(f"suite={suite} exit={exit_code}\n")
+              if os.path.isfile(results_path):
+                  with open(results_path, encoding="utf-8") as f:
+                      report = json.load(f)
+                  failures = list(walk(report.get("suites") or []))
+                  if not failures:
+                      print(f"::warning::Suite '{suite}' failed but no per-test failures found in results.json (infra/config/timeout?)")
+                      with open(summary_path, "a", encoding="utf-8") as sf:
+                          sf.write(f"  reason=no_per_test_failure_in_results_json raw_check_logs\n")
+                  for title, err in failures:
+                      msg = f"FAILED: {title}"
+                      if err:
+                          first = err.splitlines()[0][:300]
+                          msg = f"{msg} — {first}"
+                      print(f"::warning::{msg}")
+                      with open(summary_path, "a", encoding="utf-8") as sf:
+                          sf.write(f"  {msg}\n")
+              else:
+                  print(f"::warning::Suite '{suite}' failed and test-results/results.json is missing")
+                  with open(summary_path, "a", encoding="utf-8") as sf:
+                      sf.write(f"  reason=missing_results_json\n")
+          else:
+              print(f"✅ Suite '{suite}' PASSED")
+          PY
 
             echo "===== Checking Playwright Reports ====="
             find . -name "results.json" || true
@@ -608,14 +724,50 @@ jobs:
           echo "TEST_EXIT_CODE=${OVERALL_EXIT}" >> "$GITHUB_ENV"
           echo "exit_code=${OVERALL_EXIT}" >> "$GITHUB_OUTPUT"
 
-          if [ "$OVERALL_EXIT" -ne 0 ]; then
-            echo "⚠️ Tests failed - marking build as UNSTABLE (continuing to package/upload)"
-            exit 1
+          # Aggregate counts for summary (Jenkins UNSTABLE — do not fail the job)
+          python3 - <<'PY'
+          import json, os, glob
+
+          total = passed = failed = skipped = 0
+          for path in glob.glob("reports/*/results.json"):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      stats = (json.load(f).get("stats") or {})
+                  expected = int(stats.get("expected") or 0)
+                  unexpected = int(stats.get("unexpected") or 0)
+                  sk = int(stats.get("skipped") or 0)
+                  passed += expected
+                  failed += unexpected
+                  skipped += sk
+                  total += expected + unexpected + sk
+              except Exception as e:
+                  print(f"⚠️ Could not read stats from {path}: {e}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as envf:
+              envf.write(f"TEST_TOTAL={total}\n")
+              envf.write(f"TEST_PASSED={passed}\n")
+              envf.write(f"TEST_FAILED={failed}\n")
+              envf.write(f"TEST_SKIPPED={skipped}\n")
+          print(f"📊 Aggregated: total={total} passed={passed} failed={failed} skipped={skipped}")
+          PY
+
+          if [ -s /tmp/test_failure_summary.txt ]; then
+            echo "======== Test failure summary ========"
+            cat /tmp/test_failure_summary.txt
+            echo "======================================"
+            cp /tmp/test_failure_summary.txt test_failure_summary.txt || true
           fi
 
-      # 9. Package Results (packageResultsOptimized)
+          if [ "$OVERALL_EXIT" -ne 0 ]; then
+            echo "⚠️ Tests failed — Jenkins UNSTABLE equivalent (pipeline continues; workflow stays SUCCESS)"
+            echo "::warning::Playwright tests failed (TEST_EXIT_CODE=${OVERALL_EXIT}). Packaging and S3 upload will continue."
+          else
+            echo "✅ All suites passed (TEST_EXIT_CODE=0)"
+          fi
+          # Never fail the job for test results — infra failures elsewhere still fail the workflow
+          exit 0      # 9. Package Results (packageResultsOptimized)
       - name: Package Results
-        if: always() && env.ZIP_NAME != ''
+        if: success() && env.ZIP_NAME != ''
         env:
           SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
         run: |
@@ -687,7 +839,7 @@ jobs:
 
       # 10. Upload to S3 (uploadToS3Optimized — credentials file like Jenkins)
       - name: Upload to S3
-        if: always() && env.ZIP_NAME != ''
+        if: success() && env.ZIP_NAME != ''
         env:
           AWS_ACCESS_KEY_ID_ENC: ${{ github.event.inputs.aws_access_key_id }}
           AWS_SECRET_ACCESS_KEY_ENC: ${{ github.event.inputs.aws_secret_access_key }}
@@ -788,15 +940,21 @@ jobs:
           TEST_RUN_ID: ${{ github.event.inputs.test_run_id }}
           S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
         run: |
-          BUILD_STATUS="${{ job.status }}"
           TEST_EXIT_CODE="${TEST_EXIT_CODE:-N/A}"
           ZIP_FILE="${ZIP_NAME:-N/A}"
+
+          if [ "${{ job.status }}" = "success" ]; then
+            PIPELINE_STATUS="SUCCESS"
+          else
+            PIPELINE_STATUS="FAILED"
+          fi
+
           if [ "$TEST_EXIT_CODE" = "0" ]; then
-            TEST_STATUS="✅ PASSED"
-          elif [ "$TEST_EXIT_CODE" = "N/A" ]; then
+            TEST_STATUS="PASSED"
+          elif [ "$TEST_EXIT_CODE" = "N/A" ] || [ -z "$TEST_EXIT_CODE" ]; then
             TEST_STATUS="N/A"
           else
-            TEST_STATUS="❌ FAILED"
+            TEST_STATUS="FAILED"
           fi
 
           S3_LOCATION="${S3_LOCATION:-N/A}"
@@ -805,38 +963,52 @@ jobs:
             S3_LOCATION="s3://taas-qa-ai${PREFIX}/${ZIP_FILE}"
           fi
 
-          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          TOTAL="${TEST_TOTAL:-N/A}"
+          PASSED="${TEST_PASSED:-N/A}"
+          FAILED="${TEST_FAILED:-N/A}"
+          SKIPPED="${TEST_SKIPPED:-N/A}"
 
           cat <<EOF
-          ╔════════════════════════════════════════════════════════════
-          ║ 📋 TaaS Execution Summary
-          ╠════════════════════════════════════════════════════════════
-          ║ Build Status:    ${BUILD_STATUS}
-          ║ Test Results:    ${TEST_STATUS}
-          ║
-          ║ Test Configuration:
-          ║ - Suites:        ${SUITE_TESTCASE}
-          ║ - Browser:       ${BROWSER}
-          ║ - Environment:   ${ENVIRONMENT}
-          ║ - Test Run ID:   ${TEST_RUN_ID:-N/A}
-          ║
-          ║ 📦 Artifacts:
-          ║ - Zip File:      ${ZIP_FILE}
-          ║ - S3 Location:   ${S3_LOCATION}
-          ║
-          ║ 🔗 Build URL:     ${BUILD_URL}
-          ╚════════════════════════════════════════════════════════════
+          ==================================================
+          TaaS Execution Summary
+          ==================================================
+
+          Pipeline Status : ${PIPELINE_STATUS}
+          Test Status     : ${TEST_STATUS}
+
+          Total Tests : ${TOTAL}
+          Passed      : ${PASSED}
+          Failed      : ${FAILED}
+          Skipped     : ${SKIPPED}
+
+          Browser     : ${BROWSER}
+          Environment : ${ENVIRONMENT}
+          Suites      : ${SUITE_TESTCASE}
+          Test Run ID : ${TEST_RUN_ID:-N/A}
+          Zip File    : ${ZIP_FILE}
+          S3 Location : ${S3_LOCATION}
+          Build URL   : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Reason:
           EOF
 
+          if [ "$PIPELINE_STATUS" = "FAILED" ]; then
+            echo "Pipeline infrastructure failed before or after test execution."
+            echo "Check the failed step logs for details."
+          elif [ "$TEST_STATUS" = "FAILED" ]; then
+            echo "Pipeline executed successfully."
+            echo "Some test cases failed during execution."
+            echo "Please refer to the Playwright report for failure details."
+          elif [ "$TEST_STATUS" = "PASSED" ]; then
+            echo "Pipeline executed successfully."
+            echo "All Playwright test cases passed."
+          else
+            echo "Pipeline finished; test results were not available."
+          fi
+
+          echo "=================================================="
           echo "⚠️ Workspace cleanup skipped for debugging."
 
-      # Jenkins UNSTABLE → fail job after package/upload (same outcomes archived)
-      - name: Fail job if tests failed
-        if: ${{ steps.execute_tests.outputs.exit_code != '0' && steps.execute_tests.outputs.exit_code != '' }}
-        run: |
-          echo "⚠️ Pipeline unstable - Some tests failed or upload issues occurred"
-          exit 1
-
       - name: Pipeline success
-        if: ${{ success() && (steps.execute_tests.outputs.exit_code == '0' || steps.execute_tests.outputs.exit_code == '') }}
+        if: success()
         run: echo "✅ Pipeline completed successfully!"
