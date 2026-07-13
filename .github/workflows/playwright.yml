@@ -113,7 +113,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
       SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
       ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
-      ENCRYPTION_KEY: ${{ secrets.AWS_ENCRYPTION_KEY || secrets.ENCRYPTION_KEY }}
+      ENCRYPTION_KEY: ${{ secrets.aws_access_key_id || secrets.aws_secret_access_key }}
 
     steps:
       # 1–2. Checkout Framework, then Prepare Workspace (GHA needs checkout before clean)
@@ -177,8 +177,8 @@ jobs:
             echo "::error::client_pat is mandatory"
             exit 1
           fi
-          if [ -z "${ENCRYPTION_KEY// }" ]; then
-            echo "::error::Missing AWS_ENCRYPTION_KEY / ENCRYPTION_KEY secret"
+          if [ -z "${aws_access_key_id// }" ] || [ -z "${aws_secret_access_key// }" ]; then
+            echo "::error::Missing aws_access_key_id / aws_secret_access_key secret"
             exit 1
           fi
 
@@ -217,14 +217,14 @@ jobs:
       # 4. Validate Inputs
       - name: Validate Inputs
         env:
-          AWS_ACCESS_KEY_ID_ENC: ${{ github.event.inputs.aws_access_key_id }}
-          AWS_SECRET_ACCESS_KEY_ENC: ${{ github.event.inputs.aws_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ github.event.inputs.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ github.event.inputs.aws_secret_access_key }}
           SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
         run: |
           set -e
           missing=""
-          [ -z "${AWS_ACCESS_KEY_ID_ENC// }" ] && missing="$missing aws_access_key_id"
-          [ -z "${AWS_SECRET_ACCESS_KEY_ENC// }" ] && missing="$missing aws_secret_access_key"
+          [ -z "${AWS_ACCESS_KEY_ID// }" ] && missing="$missing aws_access_key_id"
+          [ -z "${AWS_SECRET_ACCESS_KEY// }" ] && missing="$missing aws_secret_access_key"
           [ -z "${SUITE_TESTCASE// }" ] && missing="$missing suite_testcase"
           if [ -n "$missing" ]; then
             echo "::error::Missing required values:$missing"
