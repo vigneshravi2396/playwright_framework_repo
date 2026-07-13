@@ -1,27 +1,840 @@
-name: Playwright Tests
+name: Reya - Test execution workflow
+
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      client_repo_url:
+        description: 'Client tests repository URL (e.g. https://github.com/company/client-tests.git)'
+        required: true
+        type: string
+        default: 'https://github.com/qadence-ai/boilerplate-qa.git'
+      client_branch:
+        description: 'Branch to checkout from the client tests repository'
+        required: true
+        type: string
+        default: 'vignesh_test_poc_new'
+      client_username:
+        description: 'Username for client repository checkout'
+        required: true
+        type: string
+        default: 'qadence-ideas2it'
+      client_pat:
+        description: 'AES-256-CBC encrypted GitHub PAT for client repository checkout'
+        required: true
+        type: string
+        default: ''
+      aws_access_key_id:
+        description: 'AES-256-CBC encrypted AWS access key ID for S3 upload'
+        required: true
+        type: string
+        default: ''
+      aws_secret_access_key:
+        description: 'AES-256-CBC encrypted AWS secret access key for S3 upload'
+        required: true
+        type: string
+        default: ''
+      suite_testcase:
+        description: 'JSON map of suite names to testcase files (use "all" for full suite)'
+        required: true
+        type: string
+        default: ''
+      browser:
+        description: 'Browser to run tests on'
+        required: true
+        type: choice
+        options:
+          - chrome
+          - firefox
+          - webkit
+          - chromium
+      environment:
+        description: 'Target environment for secrets'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+      s3_prefix:
+        description: 'Folder path inside the S3 bucket'
+        required: true
+        type: string
+        default: '/testing/results/upload/2026-06-17_07-43-21/staging'
+      aws_region:
+        description: 'AWS region for S3 upload'
+        required: false
+        type: string
+        default: 'us-east-1'
+      test_run_id:
+        description: 'Run ID for this execution'
+        required: false
+        type: string
+        default: ''
+      tenantId:
+        description: 'Tenant ID for this execution'
+        required: false
+        type: string
+        default: ''
+      applicationId:
+        description: 'App ID for this execution'
+        required: false
+        type: string
+        default: ''
+      test_execution_id:
+        description: 'Test Execution ID'
+        required: false
+        type: string
+        default: ''
+      test_execution_request_id:
+        description: 'Test Execution Request ID'
+        required: false
+        type: string
+        default: ''
+      workers:
+        description: 'Number of parallel workers'
+        required: false
+        type: string
+        default: '4'
+
+# Single job mirrors Jenkins "Run Pipeline" sequential stages.
+# Docker agent / Ensure Docker Image have no GHA equivalent — ubuntu-latest + playwright install.
 jobs:
-  test:
-    timeout-minutes: 60
+  run-pipeline:
+    name: Run Pipeline
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      CI: 'true'
+      METADATA_FILE: metadata.json
+      NPM_HASH_FILE: .npm-install-hash
+      PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
+      BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL }}
+      USER_NAME: ${{ secrets.USER_NAME || vars.USER_NAME }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
+      SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
+      ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
+      ENCRYPTION_KEY: ${{ secrets.AWS_ENCRYPTION_KEY || secrets.ENCRYPTION_KEY }}
+
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-node@v4
-      with:
-        node-version: lts/*
-    - name: Install dependencies
-      run: npm ci
-    - name: Install Playwright Browsers
-      run: npx playwright install --with-deps
-    - name: Run Playwright tests
-      run: npx playwright test
-    - uses: actions/upload-artifact@v4
-      if: ${{ !cancelled() }}
-      with:
-        name: playwright-report
-        path: playwright-report/
-        retention-days: 30
+      # 1–2. Checkout Framework, then Prepare Workspace (GHA needs checkout before clean)
+      - name: Checkout Framework Repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Workspace
+        run: |
+          set +e
+          echo "🧹 Cleaning workspace before pipeline execution..."
+          chmod -R u+w . 2>/dev/null || true
+          rm -rf node_modules test-results reports playwright-report blob-report client-tests tests .npm-install-hash 2>/dev/null || true
+          find . -maxdepth 1 -name '*.zip' -exec rm -f {} + 2>/dev/null || true
+          echo "✅ Workspace prepared"
+
+      # 3. Checkout Client Repository (+ materialize tests — Jenkins checkoutRepository)
+      - name: Checkout Client Repository
+        env:
+          CLIENT_REPO_URL: ${{ github.event.inputs.client_repo_url }}
+          CLIENT_BRANCH: ${{ github.event.inputs.client_branch }}
+          CLIENT_USERNAME: ${{ github.event.inputs.client_username }}
+          CLIENT_PAT_ENCRYPTED: ${{ github.event.inputs.client_pat }}
+        run: |
+          set -e
+
+          decrypt_value() {
+            local encrypted="$1"
+            local enc_file out_file
+            enc_file=$(mktemp)
+            out_file=$(mktemp)
+            printf '%s' "$encrypted" > "$enc_file"
+            set +x
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -a -A -in "$enc_file" -out "$out_file" -pass env:ENCRYPTION_KEY; then
+              rm -f "$enc_file" "$out_file"
+              echo "::error::OpenSSL decryption failed (invalid key or corrupt data)"
+              exit 1
+            fi
+            local plaintext
+            plaintext=$(tr -d '\r\n' < "$out_file")
+            rm -f "$enc_file" "$out_file"
+            if [ -z "$plaintext" ]; then
+              echo "::error::Decrypted value is empty"
+              exit 1
+            fi
+            printf '%s' "$plaintext"
+          }
+
+          if [ -z "${CLIENT_REPO_URL// }" ]; then
+            echo "::error::client_repo_url is mandatory"
+            exit 1
+          fi
+          if [ -z "${CLIENT_USERNAME// }" ]; then
+            echo "::error::client_username is mandatory"
+            exit 1
+          fi
+          if [ -z "${CLIENT_BRANCH// }" ]; then
+            echo "::error::client_branch is mandatory"
+            exit 1
+          fi
+          if [ -z "${CLIENT_PAT_ENCRYPTED// }" ]; then
+            echo "::error::client_pat is mandatory"
+            exit 1
+          fi
+          if [ -z "${ENCRYPTION_KEY// }" ]; then
+            echo "::error::Missing AWS_ENCRYPTION_KEY / ENCRYPTION_KEY secret"
+            exit 1
+          fi
+
+          CLIENT_GIT_PASSWORD=$(decrypt_value "$CLIENT_PAT_ENCRYPTED")
+
+          REPO_HOST_PATH="${CLIENT_REPO_URL#https://}"
+          REPO_HOST_PATH="${REPO_HOST_PATH#http://}"
+          case "$(echo "$REPO_HOST_PATH" | tr '[:upper:]' '[:lower:]')" in
+            github.com/*) AUTH_USER="x-access-token" ;;
+            *) AUTH_USER="$CLIENT_USERNAME" ;;
+          esac
+
+          rm -rf client-tests
+          set +x
+          git clone --depth 1 --no-tags --branch "$CLIENT_BRANCH" \
+            "https://${AUTH_USER}:${CLIENT_GIT_PASSWORD}@${REPO_HOST_PATH}" client-tests
+          unset CLIENT_GIT_PASSWORD
+          echo "✅ Client repository checked out: ${CLIENT_REPO_URL} @ ${CLIENT_BRANCH}"
+
+          if [ ! -d "client-tests/tests" ]; then
+            echo "::error::client-tests/tests not found in client repository"
+            exit 1
+          fi
+
+          chmod -R u+w tests 2>/dev/null || true
+          rm -rf tests
+          cp -a client-tests/tests ./tests
+          echo "✅ Copied client-tests/tests → tests/"
+
+          if [ ! -d tests ] || [ -z "$(find tests -mindepth 1 -print -quit)" ]; then
+            echo "::error::tests/ directory is missing or empty after client repository checkout"
+            exit 1
+          fi
+          echo "✅ tests/ directory verified"
+
+      # 4. Validate Inputs
+      - name: Validate Inputs
+        env:
+          AWS_ACCESS_KEY_ID_ENC: ${{ github.event.inputs.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY_ENC: ${{ github.event.inputs.aws_secret_access_key }}
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+        run: |
+          set -e
+          missing=""
+          [ -z "${AWS_ACCESS_KEY_ID_ENC// }" ] && missing="$missing aws_access_key_id"
+          [ -z "${AWS_SECRET_ACCESS_KEY_ENC// }" ] && missing="$missing aws_secret_access_key"
+          [ -z "${SUITE_TESTCASE// }" ] && missing="$missing suite_testcase"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required values:$missing"
+            exit 1
+          fi
+
+          echo "$SUITE_TESTCASE" | python3 -c '
+          import json,sys
+          try:
+              data=json.load(sys.stdin)
+          except Exception as e:
+              raise SystemExit(f"Invalid suite_testcase JSON: {e}")
+          if not isinstance(data, dict) or not data:
+              raise SystemExit("suite_testcase must be a non-empty JSON object")
+          print("suite_testcase OK:", ", ".join(data.keys()))
+          '
+
+          missing_secrets=""
+          [ -z "$BASE_URL" ] && missing_secrets="$missing_secrets BASE_URL"
+          [ -z "$USER_NAME" ] && missing_secrets="$missing_secrets USER_NAME"
+          [ -z "$PASSWORD" ] && missing_secrets="$missing_secrets PASSWORD"
+          if [ -n "$missing_secrets" ]; then
+            echo "::error::Missing required environment secrets/vars:$missing_secrets"
+            echo "Add them under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "✅ Inputs validated"
+
+      # Jenkins Debug Workspace
+      - name: Debug Workspace
+        run: |
+          echo "🔍 Inspecting workspace structure..."
+          pwd
+          ls -la
+          find . -maxdepth 3
+          sleep 2
+
+      # 5. Validate Suite (discoverSuitePaths + validateSuiteTestcase)
+      - name: Validate Suite
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+        run: |
+          set -e
+          echo "🔍 Discovering suite directories under tests/..."
+
+          SUITE_PATH_MAP_FILE=$(mktemp)
+          : > "$SUITE_PATH_MAP_FILE"
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            name=$(basename "$dir")
+            printf '%s|%s\n' "$name" "$dir" >> "$SUITE_PATH_MAP_FILE"
+          done < <(find tests -type d ! -path tests ! -path '*/.*' 2>/dev/null)
+
+          python3 - "$SUITE_PATH_MAP_FILE" <<'PY'
+          import json, os, sys
+          from collections import defaultdict
+
+          map_file = sys.argv[1]
+          groups = defaultdict(list)
+          with open(map_file, encoding='utf-8') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or '|' not in line:
+                      continue
+                  name, path = line.split('|', 1)
+                  groups[name].append(path)
+
+          suite_map = {}
+          for name, paths in groups.items():
+              suite_map[name] = paths[0] if len(paths) == 1 else paths
+
+          cache_path = os.path.join(os.getcwd(), '.suite-path-map.json')
+          with open(cache_path, 'w', encoding='utf-8') as out:
+              json.dump(suite_map, out)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as envf:
+              envf.write(f"SUITE_PATH_MAP_FILE={cache_path}\n")
+
+          print(f"✅ Discovered {len(suite_map)} suite name(s): {', '.join(suite_map.keys())}")
+          for name, path in suite_map.items():
+              display = ', '.join(path) if isinstance(path, list) else path
+              print(f"   {name} → {display}")
+          PY
+
+          python3 - <<'PY'
+          import json, os
+
+          suite_testcase = json.loads(os.environ['SUITE_TESTCASE'])
+          with open('.suite-path-map.json', encoding='utf-8') as f:
+              suite_map = json.load(f)
+
+          def resolve(suite):
+              if suite not in suite_map:
+                  raise SystemExit(f"Suite '{suite}' not found under tests/ (searched recursively)")
+              path = suite_map[suite]
+              if isinstance(path, list):
+                  if len(path) > 1:
+                      raise SystemExit(f"Ambiguous suite '{suite}': found at {', '.join(path)}")
+                  return path[0]
+              return path
+
+          for suite, testcases in suite_testcase.items():
+              print(f"Validating suite: {suite}")
+              suite_dir = resolve(suite)
+              if not os.path.isdir(suite_dir):
+                  raise SystemExit(f"Suite '{suite}' not found at {suite_dir}")
+              if not isinstance(testcases, list) or not testcases:
+                  raise SystemExit(f"Suite '{suite}' must have at least one testcase")
+              for testcase in testcases:
+                  if testcase == 'all':
+                      continue
+                  spec_path = os.path.join(suite_dir, testcase)
+                  if not os.path.isfile(spec_path):
+                      raise SystemExit(f"Testcase '{testcase}' not found at {spec_path}")
+              print(f"Suite '{suite}' validated at {suite_dir}")
+          PY
+
+      # 6. Setup (installDependenciesOptimized + browsers)
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup
+        run: |
+          set -e
+          echo "📦 Installing dependencies..."
+          current_hash=$(md5sum package-lock.json 2>/dev/null | cut -d' ' -f1 || echo 'none')
+          needs_install=1
+          if [ -f "$NPM_HASH_FILE" ] && [ -d "node_modules/@playwright" ]; then
+            saved_hash=$(cat "$NPM_HASH_FILE")
+            if [ "$saved_hash" = "$current_hash" ]; then
+              needs_install=0
+              echo "✅ Dependencies up to date (hash match: ${current_hash})"
+            fi
+          fi
+
+          if [ "$needs_install" -eq 1 ]; then
+            if [ -f package-lock.json ]; then
+              npm ci --prefer-offline --no-audit --no-fund
+            else
+              npm install --prefer-offline --no-audit --no-fund
+            fi
+            echo "$current_hash" > "$NPM_HASH_FILE"
+            echo "✅ Dependencies installed successfully (hash saved)"
+          fi
+
+          npx playwright install-deps
+          npx playwright install
+          echo "✅ Setup completed successfully"
+
+      # 7. Create Metadata
+      - name: Create Metadata
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
+          TENANT_ID: ${{ github.event.inputs.tenantId }}
+          APPLICATION_ID: ${{ github.event.inputs.applicationId }}
+          TEST_RUN_ID: ${{ github.event.inputs.test_run_id }}
+          TEST_EXECUTION_ID: ${{ github.event.inputs.test_execution_id }}
+          TEST_EXECUTION_REQUEST_ID: ${{ github.event.inputs.test_execution_request_id }}
+        run: |
+          set -e
+          echo "📝 Creating metadata..."
+          python3 - <<'PY'
+          import json, os
+
+          run_url = (
+              f"{os.environ.get('GITHUB_SERVER_URL', '')}/"
+              f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
+              f"{os.environ.get('GITHUB_RUN_ID', '')}"
+          )
+          metadata = {
+              "tenantId": os.environ.get("TENANT_ID") or "N/A",
+              "applicationId": os.environ.get("APPLICATION_ID") or "N/A",
+              "test_run_id": os.environ.get("TEST_RUN_ID") or "N/A",
+              "test_execution_id": os.environ.get("TEST_EXECUTION_ID") or "N/A",
+              "test_execution_request_id": os.environ.get("TEST_EXECUTION_REQUEST_ID") or "N/A",
+              "suite_testcase": json.loads(os.environ["SUITE_TESTCASE"]),
+              "browser": os.environ["BROWSER"],
+              "environment": os.environ["ENVIRONMENT"],
+              "s3_prefix": os.environ["S3_PREFIX"],
+              "github_run_id": os.environ.get("GITHUB_RUN_ID", "N/A"),
+              "github_run_number": os.environ.get("GITHUB_RUN_NUMBER", "N/A"),
+              "github_workflow": os.environ.get("GITHUB_WORKFLOW", "N/A"),
+              "github_run_url": run_url,
+              # Jenkins-compatible aliases for shared consumers
+              "jenkins_build_id": os.environ.get("GITHUB_RUN_ID", "N/A"),
+              "jenkins_build_number": os.environ.get("GITHUB_RUN_NUMBER", "N/A"),
+              "jenkins_job_name": os.environ.get("GITHUB_WORKFLOW", "N/A"),
+              "jenkins_build_url": run_url,
+          }
+
+          path = os.environ["METADATA_FILE"]
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(metadata, f, indent=4)
+          print(f"✅ Metadata file created: {path}")
+          PY
+          cat "$METADATA_FILE"
+          ls -lh "$METADATA_FILE"
+
+      # 8. Execute Tests (runSuiteTestcases — continue on failure like Jenkins UNSTABLE)
+      - name: Execute Tests
+        id: execute_tests
+        timeout-minutes: 100
+        continue-on-error: true
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          WORKERS: ${{ github.event.inputs.workers }}
+        run: |
+          set -e
+
+          case "$BROWSER" in
+            chrome|chromium) PLAYWRIGHT_PROJECT="chromium" ;;
+            firefox) PLAYWRIGHT_PROJECT="firefox" ;;
+            webkit) PLAYWRIGHT_PROJECT="webkit" ;;
+            *) PLAYWRIGHT_PROJECT="$BROWSER" ;;
+          esac
+
+          DATETIME=$(date +'%Y%m%d_%H%M%S')
+          eval "$(python3 - <<'PY'
+          import json, os
+          data = json.loads(os.environ["SUITE_TESTCASE"])
+          names = list(data.keys())
+          label = names[0] if len(names) == 1 else "-".join(names)
+          print(f'LABEL="{label}"')
+          PY
+          )"
+          SUITE_DIR="${LABEL}_${DATETIME}"
+          ZIP_NAME="${LABEL}_${DATETIME}.zip"
+          {
+            echo "SUITE_DIR=${SUITE_DIR}"
+            echo "ZIP_NAME=${ZIP_NAME}"
+            echo "PLAYWRIGHT_PROJECT=${PLAYWRIGHT_PROJECT}"
+          } >> "$GITHUB_ENV"
+
+          echo "🧪 Running suites: $(python3 -c 'import json,os; print(", ".join(json.loads(os.environ["SUITE_TESTCASE"]).keys()))')"
+
+          OVERALL_EXIT=0
+          FIRST=1
+
+          python3 - <<'PY' > /tmp/suite_order.txt
+          import json, os
+          for suite in json.loads(os.environ["SUITE_TESTCASE"]).keys():
+              print(suite)
+          PY
+
+          while IFS= read -r SUITE; do
+            [ -z "$SUITE" ] && continue
+            if [ "$FIRST" -eq 0 ]; then
+              rm -rf test-results playwright-report
+              echo "🧹 Cleared test-results/ and playwright-report/ for next suite"
+            fi
+            FIRST=0
+
+            echo "🧪 Running suite: ${SUITE}"
+            export SUITE
+
+            PATHS_ARG=$(python3 - <<'PY'
+          import json, os
+          suite = os.environ["SUITE"]
+          with open(os.environ.get("SUITE_PATH_MAP_FILE", ".suite-path-map.json"), encoding="utf-8") as f:
+              suite_map = json.load(f)
+          testcases = json.loads(os.environ["SUITE_TESTCASE"])[suite]
+          path = suite_map[suite]
+          if isinstance(path, list):
+              if len(path) != 1:
+                  raise SystemExit(f"Ambiguous suite '{suite}': {path}")
+              path = path[0]
+          if "all" in testcases:
+              print(path)
+          else:
+              print(" ".join(f"{path}/{tc}" for tc in testcases))
+          PY
+          )
+
+            set +e
+            (
+              while true; do
+                sleep 60
+                echo "⏳ [$(date +%H:%M:%S)] Tests still running... (This message appears every 60 seconds)"
+                if pgrep -f "playwright" > /dev/null 2>&1; then
+                  echo "   ✓ Playwright processes detected"
+                else
+                  echo "   ⚠️ No Playwright processes found"
+                fi
+              done
+            ) &
+            LOG_PID=$!
+
+            # Match Jenkins runPlaywrightTests env + command
+            export IS_REGRESSION=false
+            timeout 5400 env \
+              SUITE="$SUITE" \
+              BROWSER="$BROWSER" \
+              IS_REGRESSION=false \
+              ./node_modules/.bin/playwright test \
+              $PATHS_ARG \
+              --project="$PLAYWRIGHT_PROJECT" \
+              ${WORKERS:+--workers=$WORKERS}
+            EXIT_CODE=$?
+            kill "$LOG_PID" 2>/dev/null || true
+            set -e
+            export EXIT_CODE
+
+            echo "===== Checking Playwright Reports ====="
+            find . -name "results.json" || true
+            ls -R test-results || true
+            ls -R playwright-report || true
+
+            python3 - <<'PY'
+          import json, os, datetime
+          suite = os.environ["SUITE"]
+          exit_code = int(os.environ["EXIT_CODE"])
+          payload = {
+              "suite": suite,
+              "test_exit_code": exit_code,
+              "test_status": "PASSED" if exit_code == 0 else "FAILED",
+              "tests_executed_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+          }
+          with open(f"test_status_{suite}.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=4)
+          PY
+
+            if [ -f "test-results/results.json" ]; then
+              node <<'NODE'
+          const fs = require('fs');
+          const resultsPath = 'test-results/results.json';
+          const report = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+          const suites = Array.isArray(report.suites) ? report.suites : [];
+          const groups = new Map();
+          function groupKeyFromFile(file) {
+            if (!file) return 'unknown';
+            const slash = file.indexOf('/');
+            if (slash === -1) {
+              return file.replace(/\.[^/.]+$/, '') || file;
+            }
+            return file.slice(0, slash);
+          }
+          for (const suite of suites) {
+            const key = groupKeyFromFile(suite.file || '');
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(Object.assign({}, suite, { title: suite.title || key }));
+          }
+          report.suites = Array.from(groups.entries()).map(([key, children]) => ({
+            title: key,
+            file: key,
+            suites: children,
+          }));
+          fs.writeFileSync(resultsPath, JSON.stringify(report, null, 4));
+          NODE
+              echo "✅ Transformed results.json suite hierarchy"
+            fi
+
+            mkdir -p "reports/${SUITE}"
+            if [ -f "test-results/results.json" ]; then
+              cp "test-results/results.json" "reports/${SUITE}/results.json"
+            else
+              echo "⚠️ No results.json found for suite '${SUITE}'"
+            fi
+            if [ -d "test-results" ]; then
+              rm -rf "reports/${SUITE}/test-results"
+              cp -r test-results "reports/${SUITE}/test-results"
+            fi
+            if [ -d "playwright-report" ]; then
+              rm -rf "reports/${SUITE}/html-report"
+              cp -r playwright-report "reports/${SUITE}/html-report"
+            fi
+            echo "✅ Preserved suite artifacts → reports/${SUITE}/"
+
+            if [ "$EXIT_CODE" -ne 0 ]; then
+              OVERALL_EXIT=$EXIT_CODE
+            fi
+          done < /tmp/suite_order.txt
+
+          echo "Test exit code: ${OVERALL_EXIT}"
+          echo "TEST_EXIT_CODE=${OVERALL_EXIT}" >> "$GITHUB_ENV"
+          echo "exit_code=${OVERALL_EXIT}" >> "$GITHUB_OUTPUT"
+
+          if [ "$OVERALL_EXIT" -ne 0 ]; then
+            echo "⚠️ Tests failed - marking build as UNSTABLE (continuing to package/upload)"
+            exit 1
+          fi
+
+      # 9. Package Results (packageResultsOptimized)
+      - name: Package Results
+        if: always() && env.ZIP_NAME != ''
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+        run: |
+          set -e
+          echo "📦 Packaging results..."
+          echo "   Suite directory: ${SUITE_DIR}"
+          echo "   Zip file name: ${ZIP_NAME}"
+
+          python3 - <<'PY'
+          import json, os, subprocess, shutil
+
+          suite_testcase = json.loads(os.environ["SUITE_TESTCASE"])
+          suites = list(suite_testcase.keys())
+          suite_dir = os.environ["SUITE_DIR"]
+          zip_name = os.environ["ZIP_NAME"]
+          metadata = os.environ["METADATA_FILE"]
+
+          os.makedirs(suite_dir, exist_ok=True)
+          found = False
+          for suite in suites:
+              src = os.path.join("reports", suite)
+              dst = os.path.join(suite_dir, suite)
+              if not os.path.isdir(src):
+                  continue
+              os.makedirs(dst, exist_ok=True)
+              results = os.path.join(src, "results.json")
+              if os.path.isfile(results):
+                  shutil.copy2(results, os.path.join(dst, "results.json"))
+                  found = True
+              html = os.path.join(src, "html-report")
+              if os.path.isdir(html):
+                  shutil.copytree(html, os.path.join(dst, "html-report"), dirs_exist_ok=True)
+              tr = os.path.join(src, "test-results")
+              if os.path.isdir(tr):
+                  shutil.copytree(tr, os.path.join(dst, "test-results"), dirs_exist_ok=True)
+
+          if not found:
+              raise SystemExit("ERROR: No suite results.json found under reports/")
+
+          if os.path.isfile(metadata):
+              shutil.copy2(metadata, suite_dir)
+          for name in os.listdir("."):
+              if name.startswith("test_status") and name.endswith(".json"):
+                  shutil.copy2(name, suite_dir)
+
+          if shutil.which("pigz"):
+              print("Using pigz for parallel compression...")
+              # Jenkins: tar | pigz > zipName
+              with open(zip_name, "wb") as out:
+                  tar = subprocess.Popen(["tar", "-cf", "-", suite_dir], stdout=subprocess.PIPE)
+                  pigz = subprocess.Popen(["pigz", "-6"], stdin=tar.stdout, stdout=out)
+                  tar.stdout.close()
+                  pigz.communicate()
+                  if pigz.returncode != 0:
+                      raise SystemExit(f"Failed to create archive: {zip_name}")
+          else:
+              rc = subprocess.call(["zip", "-r", "-q", "-6", zip_name, suite_dir])
+              if rc != 0:
+                  raise SystemExit(f"Failed to create zip: {zip_name}")
+
+          if not os.path.isfile(zip_name):
+              raise SystemExit(f"❌ Failed to create zip: {zip_name}")
+
+          print(f"✅ Zip created successfully: {zip_name}")
+          subprocess.call(["ls", "-lh", zip_name])
+          shutil.rmtree(suite_dir, ignore_errors=True)
+          print(f"✅ Cleaned up temporary directory: {suite_dir}")
+          PY
+
+      # 10. Upload to S3 (uploadToS3Optimized — credentials file like Jenkins)
+      - name: Upload to S3
+        if: always() && env.ZIP_NAME != ''
+        env:
+          AWS_ACCESS_KEY_ID_ENC: ${{ github.event.inputs.aws_access_key_id }}
+          AWS_SECRET_ACCESS_KEY_ENC: ${{ github.event.inputs.aws_secret_access_key }}
+          S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
+          AWS_REGION_INPUT: ${{ github.event.inputs.aws_region }}
+        run: |
+          set -e
+          if [ -z "${ZIP_NAME}" ] || [ ! -f "${ZIP_NAME}" ]; then
+            echo "::error::Zip file not found: ${ZIP_NAME}"
+            exit 1
+          fi
+          echo "✅ Zip file found: ${ZIP_NAME}"
+
+          decrypt_value() {
+            local encrypted="$1"
+            local enc_file out_file
+            enc_file=$(mktemp)
+            out_file=$(mktemp)
+            printf '%s' "$encrypted" > "$enc_file"
+            set +x
+            if ! openssl enc -d -aes-256-cbc -pbkdf2 -a -A -in "$enc_file" -out "$out_file" -pass env:ENCRYPTION_KEY; then
+              rm -f "$enc_file" "$out_file"
+              echo "::error::OpenSSL decryption failed (invalid key or corrupt data)"
+              exit 1
+            fi
+            local plaintext
+            plaintext=$(tr -d '\r\n' < "$out_file")
+            rm -f "$enc_file" "$out_file"
+            if [ -z "$plaintext" ]; then
+              echo "::error::Decrypted value is empty"
+              exit 1
+            fi
+            printf '%s' "$plaintext"
+          }
+
+          AWS_ACCESS_KEY_ID_VAL=$(decrypt_value "$AWS_ACCESS_KEY_ID_ENC")
+          AWS_SECRET_ACCESS_KEY_VAL=$(decrypt_value "$AWS_SECRET_ACCESS_KEY_ENC")
+          AWS_REGION="${AWS_REGION_INPUT:-us-east-1}"
+
+          CREDS_FILE=".gha-aws-credentials"
+          printf '%s\n' \
+            '[default]' \
+            "aws_access_key_id = ${AWS_ACCESS_KEY_ID_VAL}" \
+            "aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY_VAL}" \
+            > "$CREDS_FILE"
+
+          PREFIX=$(echo "$S3_PREFIX" | sed -e 's|^/*||' -e 's|/*$||')
+          if [ -n "$PREFIX" ]; then
+            S3_PATH="s3://taas-qa-ai/${PREFIX}/${ZIP_NAME}"
+          else
+            S3_PATH="s3://taas-qa-ai/${ZIP_NAME}"
+          fi
+
+          which aws || (sudo apt-get update && sudo apt-get install -y awscli)
+
+          export AWS_SHARED_CREDENTIALS_FILE="${GITHUB_WORKSPACE}/${CREDS_FILE}"
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+
+          cleanup_creds() { rm -f "$CREDS_FILE"; }
+          trap cleanup_creds EXIT
+
+          echo "📤 Uploading to: ${S3_PATH}"
+          for attempt in 1 2 3; do
+            set +x
+            if aws configure list && aws s3 cp "${ZIP_NAME}" "${S3_PATH}" --region "${AWS_REGION}" --only-show-errors; then
+              echo "✅ Upload successful → ${S3_PATH}"
+              echo "S3_LOCATION=${S3_PATH}" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "⚠️ Upload attempt ${attempt} failed"
+            sleep 2
+          done
+          echo "::error::Upload failed after retries"
+          exit 1
+
+      # 11. Archive Artifacts
+      - name: Archive Artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: taas-artifacts-${{ github.run_id }}
+          path: |
+            **/*.zip
+            metadata.json
+            test_status*.json
+            test_summary.json
+          if-no-files-found: warn
+          retention-days: 15
+
+      # 12. Print Execution Summary (printSummary)
+      - name: Print Execution Summary
+        if: always()
+        env:
+          SUITE_TESTCASE: ${{ github.event.inputs.suite_testcase }}
+          BROWSER: ${{ github.event.inputs.browser }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          TEST_RUN_ID: ${{ github.event.inputs.test_run_id }}
+          S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
+        run: |
+          BUILD_STATUS="${{ job.status }}"
+          TEST_EXIT_CODE="${TEST_EXIT_CODE:-N/A}"
+          ZIP_FILE="${ZIP_NAME:-N/A}"
+          if [ "$TEST_EXIT_CODE" = "0" ]; then
+            TEST_STATUS="✅ PASSED"
+          elif [ "$TEST_EXIT_CODE" = "N/A" ]; then
+            TEST_STATUS="N/A"
+          else
+            TEST_STATUS="❌ FAILED"
+          fi
+
+          S3_LOCATION="${S3_LOCATION:-N/A}"
+          if [ "$S3_LOCATION" = "N/A" ] && [ "$ZIP_FILE" != "N/A" ]; then
+            PREFIX=$(echo "$S3_PREFIX" | sed -e 's|^/*|/|' -e 's|/*$||')
+            S3_LOCATION="s3://taas-qa-ai${PREFIX}/${ZIP_FILE}"
+          fi
+
+          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          cat <<EOF
+          ╔════════════════════════════════════════════════════════════
+          ║ 📋 TaaS Execution Summary
+          ╠════════════════════════════════════════════════════════════
+          ║ Build Status:    ${BUILD_STATUS}
+          ║ Test Results:    ${TEST_STATUS}
+          ║
+          ║ Test Configuration:
+          ║ - Suites:        ${SUITE_TESTCASE}
+          ║ - Browser:       ${BROWSER}
+          ║ - Environment:   ${ENVIRONMENT}
+          ║ - Test Run ID:   ${TEST_RUN_ID:-N/A}
+          ║
+          ║ 📦 Artifacts:
+          ║ - Zip File:      ${ZIP_FILE}
+          ║ - S3 Location:   ${S3_LOCATION}
+          ║
+          ║ 🔗 Build URL:     ${BUILD_URL}
+          ╚════════════════════════════════════════════════════════════
+          EOF
+
+          echo "⚠️ Workspace cleanup skipped for debugging."
+
+      # Jenkins UNSTABLE → fail job after package/upload (same outcomes archived)
+      - name: Fail job if tests failed
+        if: ${{ steps.execute_tests.outputs.exit_code != '0' && steps.execute_tests.outputs.exit_code != '' }}
+        run: |
+          echo "⚠️ Pipeline unstable - Some tests failed or upload issues occurred"
+          exit 1
+
+      - name: Pipeline success
+        if: ${{ success() && (steps.execute_tests.outputs.exit_code == '0' || steps.execute_tests.outputs.exit_code == '') }}
+        run: echo "✅ Pipeline completed successfully!"
