@@ -113,7 +113,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || vars.OPENAI_API_KEY }}
       SELF_HEAL_ENABLED: ${{ vars.SELF_HEAL_ENABLED || 'false' }}
       ALL_SCREENSHOT_ENABLED: ${{ vars.ALL_SCREENSHOT_ENABLED || 'false' }}
-      ENCRYPTION_KEY: ${{ secrets.AWS_ENCRYPTION_KEY || secrets.ENCRYPTION_KEY }}
+      ENCRYPTION_KEY: ${{ secrets.AWS_ENCRYPTION_KEY || secrets.ENCRYPTION_KEY || secrets['aws-encryption-key'] }}
 
     steps:
       # 1–2. Checkout Framework, then Prepare Workspace (GHA needs checkout before clean)
@@ -178,7 +178,9 @@ jobs:
             exit 1
           fi
           if [ -z "${ENCRYPTION_KEY// }" ]; then
-            echo "::error::Missing AWS_ENCRYPTION_KEY / ENCRYPTION_KEY secret"
+            echo "::error::Missing encryption key secret (Jenkins: aws-encryption-key)."
+            echo "Add repository or Environment secret named one of: AWS_ENCRYPTION_KEY, ENCRYPTION_KEY, aws-encryption-key"
+            echo "Job uses environment '${{ github.event.inputs.environment }}' — if that Environment exists, add the secret there too."
             exit 1
           fi
 
