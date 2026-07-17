@@ -382,7 +382,7 @@
             doGenerateSubmoduleConfigurations: false,
             extensions: defaultGitCloneExtensions(),
             userRemoteConfigs: [[
-                url: 'https://github.com/vigneshravi2396/playwright_framework_repo',
+                url: 'https://github.com/Ideas2IT/taas-playwright-framework.git',
                 credentialsId: 'framework-crds'
             ]]
         ]
