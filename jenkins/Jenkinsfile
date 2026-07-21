@@ -598,7 +598,16 @@
     def buildPlaywrightTestPaths(String suite, List testcases) {
         def suiteDir = resolveSuitePath(suite)
         if (testcases.contains('all')) {
-            return [suiteDir]
+            // Pass explicit .spec.ts files — directory filters are regexes and
+            // match sibling dirs (e.g. tests/SauceLogin also matches SauceLogin2).
+            def output = sh(
+                script: "find '${suiteDir}' -type f -name '*.spec.ts' | sort",
+                returnStdout: true
+            ).trim()
+            if (!output) {
+                error("No .spec.ts files found under ${suiteDir}")
+            }
+            return output.split('\n') as List
         }
         return testcases.collect { "${suiteDir}/${it}" }
     }
